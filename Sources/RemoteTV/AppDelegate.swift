@@ -337,6 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let status: String? = switch r.status {
         case .connected, .idle: nil
         case .connecting, .pairing: "Connecting…"
+        case .unpaired: "\(r.device.name) forgot this Mac. Pair again from the menu above."
         case .waitingForPIN: "Pairing…"
         case .failed(let e): e.prefix(1).uppercased() + e.dropFirst()
         }
@@ -413,7 +414,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             item.target = self
             item.representedObject = name
             item.state = name == current ? .on : .off
-            if store.credentials(for: name) == nil { item.title = "\(name) — Pair…" }
+            let lost = name == current && remote?.status == .unpaired
+            if store.credentials(for: name) == nil || lost { item.title = "\(name) — Pair Again…" }
             menu.addItem(item)
         }
         if names.isEmpty {
@@ -436,6 +438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func menuPick(_ item: NSMenuItem) {
         guard let name = item.representedObject as? String else { return }
+        if name == remote?.device.name, remote?.status == .unpaired { return pair(name) }
         if let creds = store.credentials(for: name) { use(name, creds) } else { pair(name) }
     }
 

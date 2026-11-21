@@ -26,7 +26,13 @@ func remote(_ name: String?) -> Remote {
     let store = CredentialStore()
     guard let tv = name ?? store.last else { die("no paired Apple TV: tvctl pair <name>") }
     guard let creds = store.credentials(for: tv) else { die("\(tv) isn't paired: tvctl pair \(tv)") }
-    let r = Remote(device: Device(name: tv), credentials: creds)
+    var c = creds
+    if ProcessInfo.processInfo.environment["TVCTL_FAKE_IDENTITY"] != nil {
+        // Simulates a TV that forgot us: same TV, an identity it never paired.
+        c.clientID = Array(UUID().uuidString.utf8)
+        c.clientSeed = (0..<32).map { _ in UInt8.random(in: 0...255) }
+    }
+    let r = Remote(device: Device(name: tv), credentials: c)
     r.onTiming = { what, d in print("\(what): \(stamp(d))") }
     if Trace.on { r.onTrace = { print($0); fflush(stdout) } }
     return r
@@ -46,6 +52,7 @@ func session(_ r: Remote, linger: Double = 0.5, _ body: @escaping @MainActor () 
                 exit(0)
             }
         case .failed(let e): die(e)
+        case .unpaired: die("\(r.device.name) doesn't recognize this pairing anymore: tvctl pair \(r.device.name)")
         default: break
         }
     }

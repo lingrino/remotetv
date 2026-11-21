@@ -81,6 +81,9 @@ public final class Remote {
         case pairing
         case connected
         case failed(String)
+        /// Pair-verify was refused: the TV no longer knows these credentials (reset,
+        /// removed under Remotes and Devices). Retrying can't help; pair again.
+        case unpaired
 
         public var isFailure: Bool {
             if case .failed = self { return true }
@@ -299,6 +302,13 @@ public final class Remote {
     private func auth(_ pd: [UInt8]) throws(ProtocolError) {
         switch phase {
         case .verifying(var pv):
+            if let code = try TLV8.decode(pd)[.error]?.first {
+                Remote.log.error("\(self.device.name, privacy: .public): pair-verify refused (\(code)): pairing lost")
+                queued.removeAll()
+                teardown()
+                status = .unpaired
+                return
+            }
             if try TLV8.decode(pd)[.state] == [2], let creds = credentials {
                 let m3 = try pv.m3(m2: pd, credentials: creds)
                 phase = .verifying(pv)
