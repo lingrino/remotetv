@@ -18,8 +18,7 @@ final class RemoteView: NSView {
     let back = GlassButton(symbol: "chevron.left", label: "Back", diameter: Theme.buttonDiameter + 10, pointSize: 24)
     let home = GlassButton(symbol: "tv", label: "TV")
     let power = GlassButton(symbol: "power", label: "Sleep", diameter: 44, pointSize: 16)
-    let volume = SplitPill(width: 112, height: 44, first: "minus", second: "plus", middle: "speaker.wave.2.fill",
-                           labels: ("Volume Down", "Volume Up"))
+    let volume = VolumePill(width: 136, height: 44)
     let captions = GlassButton(symbol: "captions.bubble", label: "Subtitles", diameter: 44, pointSize: 16)
 
     let pairing = PairingView()
@@ -69,8 +68,8 @@ final class RemoteView: NSView {
 
         let bottom = rowCenter + back.frame.height / 2 + 22
         volume.frame.origin = NSPoint(x: (w - volume.frame.width) / 2, y: bottom)
-        power.frame.origin = NSPoint(x: w / 2 - 88 - power.frame.width / 2, y: bottom)
-        captions.frame.origin = NSPoint(x: w / 2 + 88 - captions.frame.width / 2, y: bottom)
+        power.frame.origin = NSPoint(x: w / 2 - 96 - power.frame.width / 2, y: bottom)
+        captions.frame.origin = NSPoint(x: w / 2 + 96 - captions.frame.width / 2, y: bottom)
         for v in [power, volume, captions] as [NSView] { addSubview(v) }
 
         pairing.frame = NSRect(x: 0, y: 50, width: w, height: RemoteView.height - 50)

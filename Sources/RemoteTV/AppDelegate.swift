@@ -213,7 +213,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         view.playPause.onPress = { [weak self] down in self?.remote?.button(.playPause, down: down) }
         view.back.onPress = { [weak self] down in self?.remote?.button(.menu, down: down) }
         view.home.onPress = { [weak self] down in self?.remote?.button(.home, down: down) }
-        view.volume.onPress = { [weak self] up, down in self?.remote?.button(up ? .volumeUp : .volumeDown, down: down) }
+        view.volume.onPress = { [weak self] part, down in
+            switch part {
+            case .down: self?.remote?.button(.volumeDown, down: down)
+            case .up: self?.remote?.button(.volumeUp, down: down)
+            case .mute: if !down { self?.remote?.toggleMute() }
+            }
+        }
         view.pairing.onPick = { [weak self] name in self?.pair(name) }
         view.pairing.pin.target = self
         view.pairing.pin.action = #selector(pinEntered)

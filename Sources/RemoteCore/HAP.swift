@@ -156,9 +156,20 @@ struct PairVerify {
 
     /// Checks M4 and returns the Companion session keys (send, receive).
     func sessionKeys(m4: [UInt8]) throws(ProtocolError) -> (send: SymmetricKey, receive: SymmetricKey) {
+        try verify(m4: m4)
+        return try keys(salt: "", send: "ClientEncrypt-main", receive: "ServerEncrypt-main")
+    }
+
+    /// Checks M4 (the TV accepted our M3).
+    func verify(m4: [UInt8]) throws(ProtocolError) {
         _ = try PairSetup.check(m4, state: 4)
+    }
+
+    /// Keys for a channel secured by this verify: HKDF-SHA512 over the shared secret.
+    /// AirPlay derives one pair per channel (control, events, data stream).
+    func keys(salt: String, send: String, receive: String) throws(ProtocolError) -> (send: SymmetricKey, receive: SymmetricKey) {
         guard let shared else { throw .malformed("pair-verify out of order") }
-        return (hkdf(shared, salt: "", info: "ClientEncrypt-main"), hkdf(shared, salt: "", info: "ServerEncrypt-main"))
+        return (hkdf(shared, salt: salt, info: send), hkdf(shared, salt: salt, info: receive))
     }
 }
 

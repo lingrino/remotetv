@@ -80,55 +80,69 @@ final class GlassButton: PressView {
     }
 }
 
-/// Two buttons in one capsule (volume − / +), split down the middle.
-final class SplitPill: NSView {
-    var onPress: ((_ second: Bool, _ down: Bool) -> Void)?
+/// The volume capsule: − | mute | +, three hit zones in one glass pill. The middle
+/// shows the speaker (slashed when muted) and is dimmed when mute isn't available.
+final class VolumePill: NSView {
+    enum Part { case down, mute, up }
+    var onPress: ((Part, _ down: Bool) -> Void)?
     private let glass = NSGlassEffectView()
-    private var active: Bool?   // which half is held (false = first, true = second)
+    private let speaker = NSImageView()
+    private var active: Part?
 
-    init(width: CGFloat, height: CGFloat, first: String, second: String, middle: String?, labels: (String, String)) {
+    var muted = false { didSet { if muted != oldValue { updateSpeaker() } } }
+    var muteAvailable = false { didSet { if muteAvailable != oldValue { updateSpeaker() } } }
+
+    init(width: CGFloat, height: CGFloat) {
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
         glass.frame = bounds
         glass.cornerRadius = height / 2
         glass.effectIsInteractive = true
         addSubview(glass)
         let cfg = NSImage.SymbolConfiguration(pointSize: Theme.symbolSize - 2, weight: .semibold)
-        for (i, name) in [first, second].enumerated() {
-            let v = NSImageView(frame: NSRect(x: i == 0 ? 0 : width - height, y: 0, width: height, height: height))
-            v.image = NSImage(systemSymbolName: name, accessibilityDescription: i == 0 ? labels.0 : labels.1)?.withSymbolConfiguration(cfg)
+        for (i, (name, label)) in [("minus", "Volume Down"), ("plus", "Volume Up")].enumerated() {
+            let v = NSImageView(frame: NSRect(x: i == 0 ? 2 : width - height - 2, y: 0, width: height, height: height))
+            v.image = NSImage(systemSymbolName: name, accessibilityDescription: label)?.withSymbolConfiguration(cfg)
             v.contentTintColor = .labelColor
             v.imageScaling = .scaleNone
             addSubview(v)
         }
-        if let middle {
-            let v = NSImageView(frame: NSRect(x: (width - height) / 2, y: 0, width: height, height: height))
-            v.image = NSImage(systemSymbolName: middle, accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(pointSize: Theme.symbolSize - 4, weight: .regular))
-            v.contentTintColor = .secondaryLabelColor
-            v.imageScaling = .scaleNone
-            addSubview(v)
-        }
-        toolTip = "\(labels.0) / \(labels.1)"
+        speaker.frame = NSRect(x: (width - height) / 2, y: 0, width: height, height: height)
+        speaker.imageScaling = .scaleNone
+        addSubview(speaker)
+        updateSpeaker()
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    private func updateSpeaker() {
+        speaker.image = NSImage(systemSymbolName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                                accessibilityDescription: muted ? "Unmute" : "Mute")?
+            .withSymbolConfiguration(.init(pointSize: Theme.symbolSize - 3, weight: .regular))
+        speaker.contentTintColor = muted ? .controlAccentColor : (muteAvailable ? .secondaryLabelColor : .quaternaryLabelColor)
+        toolTip = muteAvailable ? (muted ? "Unmute" : "Mute") : "Volume"
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
 
+    private func part(at x: CGFloat) -> Part {
+        let third = bounds.width / 3
+        return x < third ? .down : (x > 2 * third ? .up : .mute)
+    }
+
     override func mouseDown(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        let second = p.x >= bounds.midX
-        active = second
+        let p = part(at: convert(event.locationInWindow, from: nil).x)
+        if p == .mute && !muteAvailable { return }
+        active = p
         glass.tintColor = NSColor.labelColor.withAlphaComponent(0.12)
-        onPress?(second, true)
+        onPress?(p, true)
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard let second = active else { return }
+        guard let p = active else { return }
         active = nil
         glass.tintColor = nil
-        onPress?(second, false)
+        onPress?(p, false)
     }
 }
 

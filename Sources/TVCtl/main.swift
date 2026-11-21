@@ -213,6 +213,18 @@ MainActor.assumeIsolated {
         }
         session(r, linger: 2) {}
 
+    case "airplay":
+        // Opens the AirPlay remote-control tunnel and prints raw MRP messages (5 s).
+        let store = CredentialStore()
+        guard let name = tv ?? args.first ?? store.last, let creds = store.credentials(for: name) else { die("not paired") }
+        let t = AirPlayTunnel(device: Device(name: name), credentials: creds)
+        let start = ContinuousClock.now
+        t.onState = { s in print("\(stamp(ContinuousClock.now - start)) state: \(s)"); if case .failed = s { exit(1) } }
+        t.onMessage = { m in print("message \(m.count) B: \(m.prefix(24).map { String(format: "%02x", $0) }.joined())") }
+        t.connect()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { exit(0) }
+        withExtendedLifetime(t) { dispatchMain() }
+
     case "sleep", "wake":
         let r = remote(args.first ?? tv)
         session(r) { cmd == "sleep" ? r.sleep() : r.wake() }
