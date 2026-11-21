@@ -1,0 +1,101 @@
+name: release
+
+# Every merge to main is a release: version 0.0.N (N = commits on main), a GitHub release
+# with RemoteTV-<version>.zip, and Casks/remotetv.rb in lingrino/homebrew-tap. Signing and
+# publishing only happen once the Apple secrets exist (Developer ID + notarization);
+# until then each run builds an ad-hoc signed zip and keeps it as a workflow artifact.
+# The cask is only published while the repo is public (brew can't download from a
+# private repo's releases).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: xcode-27
+    permissions:
+      contents: write
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer # same Xcode as validate.yml
+      SIGNED: ${{ secrets.APPLE_CERT_P12_BASE64 != '' }}
+      PUBLISH: ${{ secrets.APPLE_CERT_P12_BASE64 != '' && github.ref == 'refs/heads/main' }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the version counts commits
+
+      - name: import signing certificate
+        if: env.SIGNED == 'true'
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          pw="$(openssl rand -hex 24)"
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          base64 --decode <<<"$APPLE_CERT_P12_BASE64" > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc"
+          base64 --decode <<<"$APPLE_API_KEY_P8_BASE64" > "$RUNNER_TEMP/notary.p8"
+
+      - name: build
+        env:
+          REMOTETV_SIGN_IDENTITY: ${{ env.SIGNED == 'true' && 'Developer ID Application' || '-' }}
+          REMOTETV_NOTARY_KEY: ${{ env.SIGNED == 'true' && format('{0}/notary.p8', runner.temp) || '' }}
+          REMOTETV_NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          REMOTETV_NOTARY_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          scripts/release.sh
+          echo "VERSION=$(cat build/release/version)" >> "$GITHUB_ENV"
+
+      - name: keep zip
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: RemoteTV-${{ env.VERSION }}
+          path: build/release/RemoteTV-${{ env.VERSION }}.zip
+
+      - name: github release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip="build/release/RemoteTV-$VERSION.zip"
+          if gh release view "v$VERSION" > /dev/null 2>&1; then
+            gh release upload "v$VERSION" "$zip" --clobber
+          else
+            gh release create "v$VERSION" "$zip" --target "$GITHUB_SHA" --title "v$VERSION" \
+              --notes "$(git log -1 --format=%s)"
+          fi
+
+      - name: homebrew cask
+        if: env.PUBLISH == 'true' && !github.event.repository.private
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          tap="$RUNNER_TEMP/tap"
+          git clone --depth 1 "https://x-access-token:$TAP_TOKEN@github.com/lingrino/homebrew-tap.git" "$tap"
+          cp build/release/remotetv.rb "$tap/Casks/remotetv.rb"
+          cd "$tap"
+          git add Casks/remotetv.rb
+          if git diff --cached --quiet; then exit 0; fi
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Brew cask update for remotetv version v$VERSION"
+          git push
+
+      - name: clean up keychain
+        if: always() && env.SIGNED == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/notary.p8"

@@ -5,13 +5,14 @@
 #   make test       run unit tests (debug build, all runtime checks on)
 #   make lint       release + debug build must produce zero compiler warnings
 #   make check      lint + test: before every commit
+#   make release    what CI publishes: build/release/RemoteTV-<version>.zip + remotetv.rb (scripts/release.sh)
 #   make tvctl      build the command-line client into .build/release/tvctl (the app bundles
 #                   it in Contents/Helpers and links it into ~/.local/bin on launch)
 
 APP        := build/RemoteTV.app
 INSTALLED  := /Applications/RemoteTV.app
 
-.PHONY: all app install run test lint check clean tvctl
+.PHONY: all app install run test lint check release clean tvctl
 
 all: app
 
@@ -40,6 +41,9 @@ lint:
 	@./scripts/lint.sh
 
 check: lint test
+
+release:
+	./scripts/release.sh
 
 clean:
 	rm -rf .build build

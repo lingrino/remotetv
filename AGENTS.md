@@ -20,7 +20,12 @@ This file is the agent guide (Claude Code reads it when there is no CLAUDE.md; d
 - Single user, one Apple TV most of the time (a couple more when traveling). No config.
 - A window you can drag around (not a menu-bar extra), launched from Fred (the owner's
   launcher). Launching it again must show it immediately.
-- Local git repo at first; the owner is about to publish it on GitHub (no CI/releases yet).
+- Local git repo at first, then public on GitHub (lingrino/remotetv), released through
+  the owner's Homebrew tap like fred and peep (see CI and releases).
+
+Round 7 (2026-11-21): published: GitHub repo (Terraform in lingrino/infra), CI and
+releases copied from autotouch/fred, cask in lingrino/homebrew-tap, installed on the
+owner's Macs by their dotfiles. No AI attribution in commits or PRs, ever.
 
 Round 6 (2026-11-20): an independent full review (another model, all files) before going
 public on GitHub; its findings were fixed (see Security and Reliability). Next: publish.
@@ -57,6 +62,7 @@ make test       unit tests (debug, all checks on)
 make lint       debug + release with -warnings-as-errors: must be zero warnings
 make check      lint + test, before every commit
 make tvctl      command-line client → .build/release/tvctl
+make release    what CI publishes (scripts/release.sh): build/release/RemoteTV-<version>.zip + remotetv.rb
 swift scripts/make-icon.swift .   regenerate Resources/AppIcon.icns
 ```
 
@@ -64,6 +70,35 @@ swift scripts/make-icon.swift .   regenerate Resources/AppIcon.icns
 workarounds). Signing: `scripts/bundle.sh` signs with the owner's Developer ID from the
 shared signing keychain (`scripts/setup-signing.sh`, identical copy in fred/peep).
 Privacy grants are keyed on bundle id + team, so they survive every rebuild.
+
+### CI and releases (`.github/workflows`, same as fred/peep/autotouch)
+
+- `validate`, on every PR. The main ruleset requires a PR (no direct pushes, no force
+  pushes) and its `lint`, `test` and `scripts` jobs: `make lint`; `make test` plus a
+  release dry run (ad-hoc signed) and `brew style` on the generated cask; shellcheck and
+  actionlint. Runner label `xcode-27`: GitHub's macOS 27 arm64 image; its default Xcode
+  lags, so both workflows set `DEVELOPER_DIR` to Xcode 27.2 (move both with the local
+  toolchain). Live checks need the TV, so they stay local: `make check` and the tvctl
+  checks before opening a PR.
+- `release`, on every push to main: version 0.0.N, N = commits on main (squash merges, so
+  every merge bumps it). `scripts/release.sh` builds, signs (app and the tvctl helper, with
+  a secure timestamp), notarizes (API key), staples, zips and writes the cask. With the
+  Apple secrets it publishes GitHub release `v0.0.N` and `Casks/remotetv.rb` in
+  lingrino/homebrew-tap; without them it keeps the ad-hoc zip as a run artifact only.
+- Secrets and repo settings come from Terraform in lingrino/infra
+  (`terraform/github/repo_remotetv.tf`; `secrets_github.tf` `local.mac_app_repos`: the
+  shared Developer ID, notarization and tap-token secrets). fred's AGENTS.md has how the
+  owner rotates them.
+- Upgrades: `brew upgrade` swaps /Applications/RemoteTV.app under the running app;
+  `BundleWatcher` (FSEvents on the enclosing folder) sees the executable become a
+  different file and the app restarts into it (`open -g` unless it was frontmost) when the
+  window is on screen, or quits when hidden. No `uninstall quit:` in the cask (brew runs it
+  on every upgrade, and quitting through Apple Events needs Automation access). Quitting
+  from a main-queue block deadlocks (terminateLater waits for the goodbye, itself a
+  main-queue block): hop through `RunLoop.main.perform` as `replacedOnDisk` does.
+- The owner's Macs install it through their dotfiles (lingrino/dotfiles):
+  `cask 'lingrino/tap/remotetv'` in `home/exact_private_dot_config/private_homebrew/Brewfile_*`.
+- Renovate keeps action versions current (`renovate.json`).
 
 ### Live testing
 
@@ -140,6 +175,7 @@ Sources/RemoteTV/         the app (AppKit)
   Sidebar.swift           the slide-out panel: now-playing card, Up Next list, app grid, image loading
   ControlServer.swift     tvctl's Unix socket
   Commands.swift          tvctl commands on the app's session; installs the tvctl symlink
+  BundleWatcher.swift     restarts into a new version installed over this one (brew upgrade)
 Sources/TVCtl/            tvctl
 Tests/RemoteCoreTests/    codecs, bignum/SRP vectors (from Python), fake HAP accessory,
                           FakeTV (loopback Apple TV: framing, pair-verify, encryption) +

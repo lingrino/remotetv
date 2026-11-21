@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var devices: [Device] = []
     var browser: Browser?
     let mediaKeys = MediaKeys()
+    let bundleWatcher = BundleWatcher()
     var heldKeys: [UInt16: Button] = [:]
     var control: ControlServer?
     let root = Flipped()
@@ -80,6 +81,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             control?.start()
             installCLI()
+            bundleWatcher.onReplaced = { [weak self] in self?.replacedOnDisk() }
+            bundleWatcher.start()
             browse()
             mediaKeys.handler = { [weak self] key, down, rep in self?.mediaKey(key, down: down, repeat: rep) ?? false }
             if NSApp.isActive { mediaKeys.enable() }
@@ -101,6 +104,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard let r = remote, r.status == .connected else { return .terminateNow }
         r.goodbye { NSApp.reply(toApplicationShouldTerminate: true) }
         return .terminateLater
+    }
+
+    /// A new version was installed over this one (`brew upgrade`). On screen: restart into
+    /// it, keeping focus wherever it is. Hidden: just quit; the next launch starts the new one.
+    func replacedOnDisk() {
+        let visible = window.isVisible && !NSApp.isHidden
+        AppDelegate.log.notice("RemoteTV.app was replaced on disk: \(visible ? "restarting into" : "quitting for", privacy: .public) the new version")
+        let activate = NSApp.isActive
+        // Quit from a run-loop callout, never from inside a main-queue block (this is
+        // called from one): quitting waits for the TV goodbye (terminateLater), whose
+        // completion is a main-queue block, which can't run while another one is running.
+        RunLoop.main.perform {
+            MainActor.assumeIsolated {
+                if visible { BundleWatcher.relaunch(activate: activate) } else { NSApp.terminate(nil) }
+            }
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
