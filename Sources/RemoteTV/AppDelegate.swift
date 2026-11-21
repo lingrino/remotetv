@@ -196,7 +196,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if !down, self?.remote?.nowPlaying?.hasCaptions == true { self?.remote?.toggleCaptions() }
         }
         view.strip.onSeek = { [weak self] t in self?.remote?.seek(to: t) }
-        view.text.onEdit = { [weak self] t in self?.remote?.setText(t) }
+        view.text.onEdit = { [weak self] t in
+            guard let self else { return }
+            let (delete, insert) = RTI.diff(from: self.sentText, to: t)
+            self.sentText = t
+            self.remote?.editText(delete: delete, insert: insert)
+        }
         view.text.onDone = { [weak self] in
             guard let self else { return }
             self.window.makeFirstResponder(self.view)
@@ -356,17 +361,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
+    /// What the TV field holds as far as we know (its reported text plus our edits).
+    private var sentText = ""
+
     private func textSessionChanged(_ s: TextSession?) {
         guard window != nil else { return }
         if let s {
-            view.text.stringValue = s.text
+            sentText = s.text
+            view.text.field.stringValue = s.text
+            view.text.field.placeholderString = "Type on \(remote?.device.name ?? "the TV")"
             view.showText(true)
-            window.makeFirstResponder(view.text)
-            view.text.currentEditor()?.selectedRange = NSRange(location: (s.text as NSString).length, length: 0)
+            window.makeFirstResponder(view.text.field)
+            view.text.field.currentEditor()?.selectedRange = NSRange(location: (s.text as NSString).length, length: 0)
         } else {
-            let editing = window.firstResponder === view.text.currentEditor()
+            let editing = view.text.isEditing
             view.showText(false)
-            if editing || window.firstResponder === view.text { window.makeFirstResponder(view) }
+            if editing { window.makeFirstResponder(view) }
         }
     }
 
@@ -530,7 +540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if e.modifierFlags.contains(.command) { return false }
         let code = e.keyCode
         if code == 48, down, !view.text.isHidden {   // Tab: back into the TV's text field
-            window.makeFirstResponder(view.text)
+            window.makeFirstResponder(view.text.field)
             return true
         }
         let held: Button? = switch code {
@@ -602,6 +612,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let editItem = NSMenuItem()
         main.addItem(editItem)
         let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = edit

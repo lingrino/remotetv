@@ -87,18 +87,39 @@ public struct TextSession: Sendable, Equatable {
 }
 
 /// Builds `RTITextOperations` archives (the `_tiD` of a `_tiC` event).
-enum RTI {
-    /// `textToAssert` replaces the field's whole text; `insertion` types at the cursor.
-    static func operations(session: [UInt8], replaceWith text: String? = nil, insert: String? = nil) -> [UInt8] {
+public enum RTI {
+    /// An edit at the TV field's cursor: `delete` characters backward, then type `insert`
+    /// (TIKeyboardOutput deletionCount / insertionText). Edits rather than replacing the
+    /// whole text, because some apps (YouTube) don't report the field's current text: a
+    /// replace would wipe what's there.
+    public static func edit(session: [UInt8], delete: Int, insert: String) -> [UInt8] {
         var b = ArchiveBuilder()
         let uuid = b.object("NSUUID", [("NS.uuidbytes", .data(session))])
         var out: [(String, Plist)] = []
-        if let insert { out.append(("insertionText", .uid(b.add(.string(insert))))) }
+        if delete > 0 { out.append(("deletionCount", .int(Int64(delete)))) }
+        if !insert.isEmpty { out.append(("insertionText", .uid(b.add(.string(insert))))) }
         let output = b.object("TIKeyboardOutput", out)
-        var fields: [(String, Plist)] = [("keyboardOutput", .uid(output)), ("targetSessionUUID", .uid(uuid))]
-        if let text { fields.append(("textToAssert", .uid(b.add(.string(text))))) }
-        let ops = b.object("RTITextOperations", fields)
+        let ops = b.object("RTITextOperations", [("keyboardOutput", .uid(output)), ("targetSessionUUID", .uid(uuid))])
         return b.archive(top: [("textOperations", ops)], archiver: "RTIKeyedArchiver")
+    }
+
+    /// Replaces the field's whole text (`textToAssert`); "" clears it.
+    public static func replace(session: [UInt8], with text: String) -> [UInt8] {
+        var b = ArchiveBuilder()
+        let uuid = b.object("NSUUID", [("NS.uuidbytes", .data(session))])
+        let output = b.object("TIKeyboardOutput", [])
+        let ops = b.object("RTITextOperations", [("keyboardOutput", .uid(output)), ("targetSessionUUID", .uid(uuid)),
+                                                 ("textToAssert", .uid(b.add(.string(text))))])
+        return b.archive(top: [("textOperations", ops)], archiver: "RTIKeyedArchiver")
+    }
+
+    /// The edit that turns `old` into `new`, assuming the TV's cursor is at the end:
+    /// delete what follows the common prefix, type the rest (in characters).
+    public static func diff(from old: String, to new: String) -> (delete: Int, insert: String) {
+        let o = Array(old), n = Array(new)
+        var p = 0
+        while p < o.count && p < n.count && o[p] == n[p] { p += 1 }
+        return (o.count - p, String(n[p...]))
     }
 }
 

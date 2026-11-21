@@ -9,7 +9,7 @@ import RemoteCore
 final class RemoteView: NSView {
     let title = NSButton(title: "", target: nil, action: nil)
     let strip = NowPlayingStrip(frame: NSRect(x: 0, y: 28, width: Theme.width, height: 46))
-    let text = TextEntry(frame: NSRect(x: 16, y: 32, width: Theme.width - 32, height: 34))
+    let text = TextBar(frame: NSRect(x: 18, y: 34, width: Theme.width - 36, height: 36))
 
     let pad = ClickPad(diameter: Theme.padDiameter)
     let skipBack = IconButton(symbol: "gobackward.10", label: "Back 10 seconds")
@@ -215,35 +215,92 @@ final class NowPlayingStrip: NSView {
     }
 }
 
-/// The TV's focused text field, mirrored: edits here replace the TV field's text live.
-/// Return or Escape hands the keyboard back to the remote.
-final class TextEntry: NSTextField {
-    var onEdit: ((String) -> Void)?
-    var onDone: (() -> Void)?
+/// The TV's focused text field, mirrored in a glass capsule: typing here types on the TV
+/// (each change goes over as delete/insert at the TV's cursor). Return or Escape hands
+/// the keyboard back to the remote; Tab or a click comes back.
+final class TextBar: NSView {
+    let field = Field()
+    private let glass = NSGlassEffectView()
+    private let icon = NSImageView()
+
+    var onEdit: ((String) -> Void)? {
+        get { field.onEdit }
+        set { field.onEdit = newValue }
+    }
+    var onDone: (() -> Void)? {
+        get { field.onDone }
+        set { field.onDone = newValue }
+    }
+
+    override var isFlipped: Bool { true }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        font = .systemFont(ofSize: 15)
-        placeholderString = "Type on the TV"
-        bezelStyle = .roundedBezel
-        focusRingType = .default
-        cell?.sendsActionOnEndEditing = false
-        cell?.usesSingleLineMode = true
-        cell?.lineBreakMode = .byTruncatingHead
-        target = self
-        action = #selector(returned)
+        glass.frame = bounds
+        glass.cornerRadius = bounds.height / 2
+        addSubview(glass)
+        icon.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+        icon.contentTintColor = .secondaryLabelColor
+        icon.frame = NSRect(x: 12, y: 0, width: 20, height: bounds.height)
+        icon.imageScaling = .scaleNone
+        addSubview(icon)
+        field.frame = NSRect(x: 38, y: (bounds.height - 20) / 2, width: bounds.width - 52, height: 20)
+        field.onFocus = { [weak self] on in
+            self?.glass.tintColor = on ? NSColor.controlAccentColor.withAlphaComponent(0.14) : nil
+            self?.icon.contentTintColor = on ? .controlAccentColor : .secondaryLabelColor
+        }
+        addSubview(field)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    override func textDidChange(_ notification: Notification) {
-        super.textDidChange(notification)
-        onEdit?(stringValue)
+    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(field) }
+
+    var isEditing: Bool { field.currentEditor() != nil && window?.firstResponder === field.currentEditor() }
+
+    final class Field: NSTextField {
+        var onEdit: ((String) -> Void)?
+        var onDone: (() -> Void)?
+        var onFocus: ((Bool) -> Void)?
+
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            font = .systemFont(ofSize: 14)
+            isBordered = false
+            isBezeled = false
+            drawsBackground = false
+            focusRingType = .none
+            cell?.sendsActionOnEndEditing = false
+            cell?.usesSingleLineMode = true
+            cell?.isScrollable = true
+            cell?.wraps = false
+            target = self
+            action = #selector(returned)
+        }
+
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func becomeFirstResponder() -> Bool {
+            let ok = super.becomeFirstResponder()
+            if ok { onFocus?(true) }
+            return ok
+        }
+
+        override func textDidEndEditing(_ notification: Notification) {
+            super.textDidEndEditing(notification)
+            onFocus?(false)
+        }
+
+        override func textDidChange(_ notification: Notification) {
+            super.textDidChange(notification)
+            onEdit?(stringValue)
+        }
+
+        @objc private func returned() { onDone?() }
+
+        override func cancelOperation(_ sender: Any?) { onDone?() }
     }
-
-    @objc private func returned() { onDone?() }
-
-    override func cancelOperation(_ sender: Any?) { onDone?() }
 }
 
 /// Pairing: pick an Apple TV, then type the PIN it shows.

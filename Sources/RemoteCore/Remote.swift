@@ -562,19 +562,27 @@ public final class Remote {
     /// Subtitles on/off for the playing item (when it has caption tracks).
     public func toggleCaptions() {
         whenConnected { [weak self] in
-            self?.request("ToggleCaptions", count: 0) { _ in }
-        }
-        if var np = nowPlaying {
-            np.captionsEnabled.toggle()
-            nowPlaying = np
-            onNowPlaying?(np)
+            self?.request("ToggleCaptions", count: 0) { _ in
+                // The TV doesn't always push a new snapshot after a toggle: ask.
+                self?.refreshNowPlaying()
+            }
         }
     }
 
-    /// Replaces the focused TV text field's contents with `text`.
+    /// Edits the focused TV text field: `delete` characters before the cursor, then type
+    /// `insert`. See `RTI.diff` for turning a local field change into an edit.
+    public func editText(delete: Int, insert: String) {
+        guard delete > 0 || !insert.isEmpty else { return }
+        sendText(textSession.map { RTI.edit(session: $0.uuid, delete: delete, insert: insert) })
+    }
+
+    /// Replaces the focused TV text field's whole contents.
     public func setText(_ text: String) {
-        guard let s = textSession, case .session = phase else { return }
-        let ops = RTI.operations(session: s.uuid, replaceWith: text)
+        sendText(textSession.map { RTI.replace(session: $0.uuid, with: text) })
+    }
+
+    private func sendText(_ ops: [UInt8]?) {
+        guard let ops, case .session = phase else { return }
         event("_tiC", count: 2) { w in
             w.string("_tiV"); w.int(1)
             w.string("_tiD"); w.data(ops)

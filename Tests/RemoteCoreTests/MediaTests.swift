@@ -84,7 +84,7 @@ private let sample = Plist.dict([
 }
 
 @Test func rtiOperationsArchive() throws {
-    let bytes = RTI.operations(session: Array(0..<16), replaceWith: "abc")
+    let bytes = RTI.replace(session: Array(0..<16), with: "abc")
     // Foundation parses it too (independent reader).
     #expect(try PropertyListSerialization.propertyList(from: Data(bytes), format: nil) is [String: Any])
     let a = try KeyedArchive(bytes)
@@ -95,8 +95,20 @@ private let sample = Plist.dict([
     #expect(a.className(a.field(ops, "keyboardOutput")) == "TIKeyboardOutput")
     let p = try Plist.decode(bytes)
     #expect(p["$archiver"]?.string == "RTIKeyedArchiver")
-    let insert = try KeyedArchive(RTI.operations(session: Array(0..<16), insert: "x"))
-    let ops2 = insert.resolve(insert.top.first?.1)
-    #expect(insert.field(insert.field(ops2, "keyboardOutput"), "insertionText")?.string == "x")
-    #expect(insert.field(ops2, "textToAssert") == nil)
+    let edit = try KeyedArchive(RTI.edit(session: Array(0..<16), delete: 2, insert: "xy"))
+    let ops2 = edit.resolve(edit.top.first?.1)
+    let out = edit.field(ops2, "keyboardOutput")
+    #expect(edit.field(out, "insertionText")?.string == "xy")
+    #expect(edit.field(out, "deletionCount")?.int == 2)
+    #expect(edit.field(ops2, "textToAssert") == nil)
+}
+
+@Test func rtiDiff() {
+    #expect(RTI.diff(from: "", to: "hel") == (0, "hel"))
+    #expect(RTI.diff(from: "hel", to: "hello") == (0, "lo"))
+    #expect(RTI.diff(from: "hello", to: "hell") == (1, ""))
+    #expect(RTI.diff(from: "hello", to: "help") == (2, "p"))
+    #expect(RTI.diff(from: "hello", to: "") == (5, ""))
+    #expect(RTI.diff(from: "café", to: "cafés") == (0, "s"))
+    #expect(RTI.diff(from: "a👍🏽", to: "a") == (1, ""))   // one character, several code points
 }
