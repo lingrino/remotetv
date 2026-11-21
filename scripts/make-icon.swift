@@ -1,5 +1,6 @@
-// Generates Resources/AppIcon.icns. Run: swift scripts/make-icon.swift
-// A squircle with a slate-to-indigo gradient and a white Siri Remote silhouette (SF Symbol appletvremote.gen4.fill).
+// Generates Resources/AppIcon.icns. Run: swift scripts/make-icon.swift .
+// A squircle with a slate-to-indigo gradient and a white remote drawn from plain shapes
+// (no SF Symbols: their license doesn't allow use in app icons).
 import AppKit
 
 func render(_ px: Int) -> Data {
@@ -12,14 +13,31 @@ func render(_ px: Int) -> Data {
     // macOS icon grid: 824/1024 body with ~185/1024 corner radius, centered.
     let inset = s * 100 / 1024
     let body = NSRect(x: inset, y: inset, width: s - 2 * inset, height: s - 2 * inset)
-    let path = NSBezierPath(roundedRect: body, xRadius: s * 185 / 1024, yRadius: s * 185 / 1024)
+    let squircle = NSBezierPath(roundedRect: body, xRadius: s * 185 / 1024, yRadius: s * 185 / 1024)
     NSGradient(colors: [NSColor(srgbRed: 0.10, green: 0.12, blue: 0.20, alpha: 1),
-                        NSColor(srgbRed: 0.27, green: 0.33, blue: 0.62, alpha: 1)])!.draw(in: path, angle: 70)
-    let cfg = NSImage.SymbolConfiguration(pointSize: s * 0.56, weight: .regular)
-        .applying(.init(paletteColors: [.white]))
-    let sym = NSImage(systemSymbolName: "appletvremote.gen4.fill", accessibilityDescription: nil)!.withSymbolConfiguration(cfg)!
-    let sz = sym.size
-    sym.draw(in: NSRect(x: body.midX - sz.width / 2, y: body.midY - sz.height / 2, width: sz.width, height: sz.height))
+                        NSColor(srgbRed: 0.27, green: 0.33, blue: 0.62, alpha: 1)])!.draw(in: squircle, angle: 70)
+
+    // The remote: a tall white rounded slab, with the clickpad and buttons cut in the
+    // background's dark tone.
+    let u = s / 1024
+    let remote = NSRect(x: s / 2 - 150 * u, y: 170 * u, width: 300 * u, height: 684 * u)
+    NSColor.white.setFill()
+    NSBezierPath(roundedRect: remote, xRadius: 150 * u, yRadius: 150 * u).fill()
+    let ink = NSColor(srgbRed: 0.16, green: 0.19, blue: 0.34, alpha: 1)
+    ink.setFill()
+    let cx = remote.midX
+    let pad: CGFloat = 220 * u
+    NSBezierPath(ovalIn: NSRect(x: cx - pad / 2, y: remote.maxY - 60 * u - pad, width: pad, height: pad)).fill()
+    NSColor.white.setFill()
+    let inner: CGFloat = 70 * u
+    NSBezierPath(ovalIn: NSRect(x: cx - inner / 2, y: remote.maxY - 60 * u - pad / 2 - inner / 2, width: inner, height: inner)).fill()
+    ink.setFill()
+    let b: CGFloat = 76 * u, gap: CGFloat = 30 * u
+    let rowY = remote.maxY - 60 * u - pad - 50 * u - b
+    for dx in [-(b + gap) / 2, (b + gap) / 2] {
+        NSBezierPath(ovalIn: NSRect(x: cx + dx - b / 2, y: rowY, width: b, height: b)).fill()
+        NSBezierPath(ovalIn: NSRect(x: cx + dx - b / 2, y: rowY - b - gap, width: b, height: b)).fill()
+    }
     NSGraphicsContext.restoreGraphicsState()
     return rep.representation(using: .png, properties: [:])!
 }
