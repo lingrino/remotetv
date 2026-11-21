@@ -28,10 +28,28 @@ public struct NowPlaying: Sendable, Equatable {
 
     public var isPlaying: Bool { state == 1 && rate != 0 }
 
+    /// Times from the TV are trusted only when finite and plausible (0…~4 months); NaN or
+    /// infinity would crash any Int conversion downstream.
+    static func seconds(_ d: Double?) -> Double? {
+        guard let d, d.isFinite, d >= 0, d < 1e7 else { return nil }
+        return d
+    }
+
+    static func rate(_ d: Double?) -> Double? {
+        guard let d, d.isFinite, abs(d) <= 64 else { return nil }
+        return d
+    }
+
+    static func timestamp(_ d: Double?) -> Double? {
+        guard let d, d.isFinite, abs(d) < 1e10 else { return nil }
+        return d
+    }
+
     /// Seconds into the item at `now`, clamped to the duration.
     public func position(at now: Date = Date()) -> Double {
         var p = elapsed
         if isPlaying { p += (now.timeIntervalSinceReferenceDate - timestamp) * rate }
+        guard p.isFinite else { return 0 }
         p = max(0, p)
         if let duration, duration > 0 { p = min(p, duration) }
         return p
@@ -43,10 +61,10 @@ public struct NowPlaying: Sendable, Equatable {
         let md = a.field(root, "metadata")
         title = a.field(md, "title")?.string
         subtitle = a.field(md, "episodeTitle")?.string
-        duration = a.field(md, "duration")?.double
-        elapsed = a.field(md, "timeOffset")?.double ?? 0
-        timestamp = a.field(md, "timestamp")?.double ?? Date().timeIntervalSinceReferenceDate
-        rate = a.field(root, "playbackRate")?.double ?? 0
+        duration = NowPlaying.seconds(a.field(md, "duration")?.double).flatMap { $0 > 0 ? $0 : nil }
+        elapsed = NowPlaying.seconds(a.field(md, "timeOffset")?.double) ?? 0
+        timestamp = NowPlaying.timestamp(a.field(md, "timestamp")?.double) ?? Date().timeIntervalSinceReferenceDate
+        rate = NowPlaying.rate(a.field(root, "playbackRate")?.double) ?? 0
         state = Int(a.field(root, "playbackState")?.int ?? 0)
         captionsEnabled = a.field(root, "captionsEnabled")?.bool ?? false
         hasCaptions = a.field(root, "hasValidCaptionOptions")?.bool ?? false

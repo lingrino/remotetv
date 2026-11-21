@@ -12,7 +12,9 @@ private func enc(_ v: OPACK.Value) -> [UInt8] { OPACK.encode(v) }
     #expect(enc(.int(0)) == [0x08])
     #expect(enc(.int(0x27)) == [0x2F])
     #expect(enc(.int(0x28)) == [0x30, 0x28])
+    #expect(enc(.int(0x80)) == [0x31, 0x80, 0x00])      // 0x30 0x80 would be -128
     #expect(enc(.int(0x1FF)) == [0x31, 0xFF, 0x01])
+    #expect(enc(.int(0x8000)) == [0x32, 0x00, 0x80, 0x00, 0x00])
     #expect(enc(.int(0x1FF_FFFF)) == [0x32, 0xFF, 0xFF, 0xFF, 0x01])
     #expect(enc(.int(0x1FF_FFFF_FFFF_FFFF)) == [0x33, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
     #expect(enc(.double(1.0)) == [0x36, 0, 0, 0, 0, 0, 0, 0xF0, 0x3F])
@@ -63,6 +65,9 @@ private func enc(_ v: OPACK.Value) -> [UInt8] { OPACK.encode(v) }
     #expect(try OPACK.decode([0x05] + [UInt8](repeating: 0x12, count: 16)) == .uuid([UInt8](repeating: 0x12, count: 16)))
     #expect(try OPACK.decode([0x35, 0x00, 0x00, 0x80, 0x3F]) == .double(1.0))
     #expect(try OPACK.decode([0x31, 0x01, 0x00]) == .int(1))
+    #expect(try OPACK.decode([0x31, 0xC6, 0xE5]) == .int(-6714))   // as the TV sends error codes
+    #expect(try OPACK.decode([0x30, 0xFF]) == .int(-1))
+    #expect(try OPACK.decode([0x32, 0xFF, 0xFF, 0xFF, 0x7F]) == .int(Int64(Int32.max)))
 }
 
 @Test func opackRejectsGarbage() {

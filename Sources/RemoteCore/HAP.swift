@@ -89,9 +89,13 @@ struct PairSetup: Sendable {
             throw .malformed("pair-setup M6 contents")
         }
         // M6 is already authenticated by the SRP session key (only the TV that showed
-        // the PIN can produce it), so the Ed25519 signature is a second check; tolerate
-        // its absence.
-        if let sig = inner[.signature], let pub = try? Curve25519.Signing.PublicKey(rawRepresentation: ltpk) {
+        // the PIN can produce it); the Ed25519 signature is a second check, required to
+        // verify when present. The key must be a valid Ed25519 key either way: pair-verify
+        // depends on it.
+        guard let pub = try? Curve25519.Signing.PublicKey(rawRepresentation: ltpk) else {
+            throw .authentication("the Apple TV sent an invalid key")
+        }
+        if let sig = inner[.signature] {
             let x = hkdf(srp.sessionKey, salt: "Pair-Setup-Accessory-Sign-Salt", info: "Pair-Setup-Accessory-Sign-Info")
             guard pub.isValidSignature(sig, for: x.bytes + id + ltpk) else {
                 throw .authentication("the Apple TV's signature didn't verify")

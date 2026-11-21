@@ -25,7 +25,7 @@ extension AppDelegate {
       show | hide             the RemoteTV window
       sidebar [on|off|upnext|apps]  the sidebar (now playing, Up Next, apps)
       raw <_i> [k=v…]         any Companion request (debugging)
-      snapshot <path.png>     window to PNG (debugging)
+      snapshot <png> [dark|light] [controls]   window to PNG (debugging)
       direct <command>        talk to the TV over tvctl's own connection (kicks the app's)
       scan | pair <tv>        find Apple TVs / pair (direct)
     """
@@ -39,9 +39,13 @@ extension AppDelegate {
         switch cmd {
         case "help", "-h", "--help":
             return ok(AppDelegate.usage)
-        case "reload":
+        case "reload":   // tvctl pair changed the pairings
             store = CredentialStore()
-            if remote == nil, let name = store.last, let creds = store.credentials(for: name) { use(name, creds) }
+            if let r = remote, let creds = store.credentials(for: r.device.name) {
+                if creds != r.credentials { use(r.device.name, creds) }
+            } else if let name = store.last, let creds = store.credentials(for: name) {
+                use(name, creds)
+            }
             return ok("")
         case "show":
             show()
@@ -55,8 +59,15 @@ extension AppDelegate {
             if a == "apps" { sidebarTab(1) } else if a == "upnext" { sidebarTab(0) }
             return ok("")
         case "snapshot":
-            guard let path = rest.first else { return fail("usage: snapshot <path.png>") }
+            // Debug: window content to PNG (Liquid Glass doesn't render offscreen). Options:
+            // dark | light (appearance for this shot), controls (hide the pairing panel).
+            guard let path = rest.first else { return fail("usage: snapshot <path.png> [dark|light] [controls]") }
+            let saved = window.appearance
+            if rest.contains("dark") { window.appearance = NSAppearance(named: .darkAqua) }
+            if rest.contains("light") { window.appearance = NSAppearance(named: .aqua) }
+            if rest.contains("controls") { view.showsPairing = false }
             snapshot(to: (path as NSString).expandingTildeInPath)
+            window.appearance = saved
             return ok(path)
         case "status":
             return ok(statusReport())
@@ -65,6 +76,7 @@ extension AppDelegate {
         }
 
         guard let r = remote else { return fail("not paired: run `tvctl pair <tv>` or pair in the app") }
+        if !window.isVisible || NSApp.isHidden { armIdle() }   // a hidden app's session still times out
         ready(r) { [weak self] connected in
             guard let self else { return }
             guard connected else { return fail("\(r.device.name): \(AppDelegate.describe(r.status))") }
@@ -134,12 +146,10 @@ extension AppDelegate {
             }
         case "raw":
             guard let id = rest.first else { return fail("usage: raw <_i> [key=value…]") }
-            var content: [String: OPACK.Value] = [:]
-            for kv in rest.dropFirst() {
-                let p = kv.split(separator: "=", maxSplits: 1).map(String.init)
-                guard p.count == 2 else { return fail("bad argument \(kv)") }
-                content[p[0]] = if let i = Int64(p[1]) { .int(i) } else if p[1].contains("."), let d = Double(p[1]) { .double(d) }
-                    else if p[1] == "true" || p[1] == "false" { .bool(p[1] == "true") } else { .string(p[1]) }
+            let content: [String: OPACK.Value]
+            switch OPACK.arguments(rest.dropFirst()) {
+            case .success(let c): content = c
+            case .failure(let e): return fail(e.description)
             }
             r.raw(id, content) { value, error in
                 if let error { return fail(error) }
@@ -186,7 +196,7 @@ extension AppDelegate {
         case .waitingForPIN: "waiting for the PIN"
         case .pairing: "pairing"
         case .connected: "connected"
-        case .failed(let e): e
+        case .failed(let e): e.description
         case .unpaired: "the TV forgot this pairing; pair again"
         }
     }

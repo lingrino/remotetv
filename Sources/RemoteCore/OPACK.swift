@@ -3,7 +3,8 @@
 /// Tags (first byte of each object):
 ///   0x01 true · 0x02 false · 0x03 end of an open container · 0x04 null
 ///   0x05 UUID (16 bytes) · 0x06 date (8 bytes, little-endian double)
-///   0x08–0x2F small integer 0…39 · 0x30/31/32/33 integer in 1/2/4/8 bytes (LE)
+///   0x08–0x2F small integer 0…39 · 0x30/31/32/33 signed integer in 1/2/4/8 bytes (LE;
+///   the TV sends -6714 as 0x31 C6 E5)
 ///   0x35 float32 · 0x36 float64 (LE)
 ///   0x40–0x60 UTF-8 string of 0…32 bytes · 0x61–0x64 string, length in 1–4 bytes
 ///   0x70–0x90 data of 0…32 bytes · 0x91–0x94 data, length in 1/2/4/8 bytes
@@ -11,9 +12,10 @@
 ///   0xD0–0xDE array of 0…14 items · 0xDF array closed by 0x03
 ///   0xE0–0xEE dictionary of 0…14 pairs · 0xEF dictionary closed by 0x03
 ///
-/// References point into the list of previously decoded objects that aren't
-/// single-byte (strings, data, sized numbers, UUIDs, dates). The encoder never emits
-/// them; the decoder resolves them.
+/// References point into the list of previously decoded objects other than booleans,
+/// null, small integers and containers (strings — even empty ones — data, sized numbers,
+/// UUIDs, dates), first occurrence only, as observed from Apple's encoder. The encoder
+/// never emits references; the decoder resolves them.
 public enum OPACK {
     public indirect enum Value: Equatable, Sendable {
         case null
@@ -87,13 +89,14 @@ public enum OPACK {
         /// is unknown, so negative numbers go as doubles (`double`).
         public mutating func int(_ v: Int64) {
             precondition(v >= 0, "OPACK: negative integers are sent as doubles")
+            // Signed widths: 200 in one byte would read as -56.
             if v < 0x28 {
                 bytes.append(UInt8(v) + 8)
-            } else if v <= 0xFF {
+            } else if v <= 0x7F {
                 bytes.append(0x30); appendLE(UInt64(v), 1)
-            } else if v <= 0xFFFF {
+            } else if v <= 0x7FFF {
                 bytes.append(0x31); appendLE(UInt64(v), 2)
-            } else if v <= 0xFFFF_FFFF {
+            } else if v <= 0x7FFF_FFFF {
                 bytes.append(0x32); appendLE(UInt64(v), 4)
             } else {
                 bytes.append(0x33); appendLE(UInt64(v), 8)
@@ -163,7 +166,10 @@ public enum OPACK {
             case .double(let d): double(d)
             case .string(let s): string(s)
             case .data(let d): data(d)
-            case .uuid(let u): bytes.append(0x05); bytes.append(contentsOf: u.prefix(16))
+            case .uuid(let u):
+                bytes.append(0x05)
+                bytes.append(contentsOf: u.prefix(16))
+                if u.count < 16 { bytes.append(contentsOf: [UInt8](repeating: 0, count: 16 - u.count)) }
             case .date(let d): bytes.append(0x06); appendLE(d.bitPattern, 8)
             case .array(let a):
                 array(a.count)
@@ -184,6 +190,20 @@ public enum OPACK {
                 v >>= 8
             }
         }
+    }
+
+    /// `key=value` command-line arguments (tvctl raw) as a dictionary: integers, doubles
+    /// (with a "."), true/false, else strings. Nil (with the bad argument) if one has no "=".
+    public static func arguments(_ args: some Sequence<String>) -> Result<[String: Value], ProtocolError> {
+        var out: [String: Value] = [:]
+        for kv in args {
+            let p = kv.split(separator: "=", maxSplits: 1).map(String.init)
+            guard p.count == 2 else { return .failure(.malformed("bad argument \(kv)")) }
+            let v = p[1]
+            out[p[0]] = if let i = Int64(v) { .int(i) } else if v.contains("."), let d = Double(v) { .double(d) }
+                else if v == "true" || v == "false" { .bool(v == "true") } else { .string(v) }
+        }
+        return .success(out)
     }
 
     public static func encode(_ v: Value) -> [UInt8] {
@@ -243,8 +263,11 @@ public enum OPACK {
             case 0x06: return remember(.date(Double(bitPattern: try uintLE(8))))
             case 0x08...0x2F: return .int(Int64(tag - 8))
             case 0x30...0x33:
-                let v = try uintLE(1 << Int(tag & 0x0F))
-                return remember(.int(Int64(bitPattern: v)))
+                let n = 1 << Int(tag & 0x0F)
+                let v = try uintLE(n)
+                // Sign-extend from n bytes.
+                let shift = UInt64(64 - 8 * n)
+                return remember(.int(Int64(bitPattern: v << shift) >> Int64(shift)))
             case 0x35: return remember(.double(Double(Float(bitPattern: UInt32(try uintLE(4))))))
             case 0x36: return remember(.double(Double(bitPattern: try uintLE(8))))
             case 0x40...0x60: return try string(Int(tag - 0x40))

@@ -99,7 +99,7 @@ private func session() -> MediaRemote {
     let known = "438922cf0802000000000000000000000100000000000000020000002000000003000000010000000000000001008b00010000000000000001000000"
     let bytes = MediaRemote.hidEvent(page: 1, usage: 0x8B, down: true)
     #expect(bytes.count == 60)
-    #expect(hex(bytes) == known)
+    #expect(Hex.encode(bytes) == known)
     let mute = MediaRemote.hidEvent(page: 12, usage: 0xE2, down: false)
     #expect(Array(mute[43..<49]) == [0x00, 0x0C, 0x00, 0xE2, 0x00, 0x00])
 }

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 import os
@@ -80,7 +81,7 @@ public final class Remote {
         case waitingForPIN
         case pairing
         case connected
-        case failed(String)
+        case failed(ProtocolError)
         /// Pair-verify was refused: the TV no longer knows these credentials (reset,
         /// removed under Remotes and Devices). Retrying can't help; pair again.
         case unpaired
@@ -92,22 +93,22 @@ public final class Remote {
     }
 
     public let device: Device
-    public private(set) var credentials: Credentials?
-    public private(set) var status: Status = .idle {
+    public internal(set) var credentials: Credentials?
+    public internal(set) var status: Status = .idle {
         didSet {
             guard status != oldValue else { return }
             Remote.log.info("\(self.device.name, privacy: .public): \(String(describing: self.status), privacy: .public)")
             onStatus?(status)
         }
     }
-    public private(set) var power: PowerState = .unknown { didSet { if power != oldValue { onPower?(power) } } }
-    public private(set) var controls: MediaControls = []
+    public internal(set) var power: PowerState = .unknown { didSet { if power != oldValue { onPower?(power) } } }
+    public internal(set) var controls: MediaControls = []
     /// False until the TV has said which controls work (then dimming applies).
-    public private(set) var controlsKnown = false
+    public internal(set) var controlsKnown = false
     /// What's playing (nil: nothing, or not known yet).
-    public private(set) var nowPlaying: NowPlaying?
+    public internal(set) var nowPlaying: NowPlaying?
     /// The TV's focused text field, if any.
-    public private(set) var textSession: TextSession?
+    public internal(set) var textSession: TextSession?
 
     public var onStatus: ((Status) -> Void)?
     public var onPower: ((PowerState) -> Void)?
@@ -127,9 +128,9 @@ public final class Remote {
     /// How we introduce ourselves (`_systemInfo`, pairing name shown in the TV's settings).
     public var clientName = "RemoteTV"
 
-    private static let log = Logger(subsystem: "com.lingrino.remotetv", category: "remote")
+    static let log = Logger(subsystem: "com.lingrino.remotetv", category: "remote")
 
-    private enum Phase {
+    enum Phase {
         case idle
         case connecting
         case verifying(PairVerify)
@@ -140,24 +141,36 @@ public final class Remote {
         case session
     }
 
-    private var phase: Phase = .idle
-    private var conn: Connection?
-    private var xid = Int.random(in: 0..<0x8000)
-    private var replies: [Int: (OPACK.Value) -> Void] = [:]
-    private var rawReplies: [Int: (OPACK.Value?, String?) -> Void] = [:]
-    private var queued: [() -> Void] = []
-    private var timeout: DispatchWorkItem?
-    private var sid: UInt64 = 0
-    private var started = ContinuousClock.now
+    var phase: Phase = .idle
+    var conn: Connection?
+    var xid = Int.random(in: 0..<0x8000)
+    var replies: [Int: (OPACK.Value) -> Void] = [:]
+    /// `raw` requests on the wire, by xid. Every one completes exactly once: its reply, the
+    /// connection ending, or 5 s (`Waiter`).
+    var rawReplies: [Int: Waiter] = [:]
+    /// Commands waiting for a connection. Each runs only if it's at most `queueMaxAge`
+    /// old when the session comes up: a press replayed late is worse than a lost one.
+    var queued: [(at: ContinuousClock.Instant, run: () -> Void)] = []
+    static var queueMaxAge: Duration = .seconds(2)
+    /// How long a `raw` request may wait for its answer.
+    static var rawTimeout: Double = 5
+    /// Bumped per pairing attempt; stale SRP results are dropped.
+    var attempt = 0
+    var timeout: DispatchWorkItem?
+    var sid: UInt64 = 0
+    var started = ContinuousClock.now
 
     // Liveness (see "Reliability" below).
-    private var awaiting: [Int: ContinuousClock.Instant] = [:]
-    private var deafCheck: DispatchWorkItem?
-    private var keepalive: Timer?
-    private var lastAnswer = ContinuousClock.now
-    private var lastKnock = ContinuousClock.now - .seconds(60)
+    var awaiting: [Int: ContinuousClock.Instant] = [:]
+    var deafCheck: DispatchWorkItem?
+    var keepalive: Timer?
+    var lastAnswer = ContinuousClock.now
+    var lastKnock = ContinuousClock.now - .seconds(60)
+    /// Failed connects since the last session (knocking stops after a few: away from home
+    /// the remembered address belongs to someone else's network).
+    var failStreak = 0
     /// Where the TV was last reached; knocked on to wake it when it can't be found.
-    public private(set) var lastHost: NWEndpoint.Host?
+    public internal(set) var lastHost: NWEndpoint.Host?
 
     public init(device: Device, credentials: Credentials?) {
         self.device = device
@@ -171,7 +184,7 @@ public final class Remote {
 
     /// Connects with the stored credentials. No-op while connected or connecting.
     public func connect() {
-        guard credentials != nil else { status = .failed("not paired"); return }
+        guard credentials != nil else { status = .failed(.authentication("not paired")); return }
         switch phase {
         case .idle: break
         default: return
@@ -185,6 +198,7 @@ public final class Remote {
     }
 
     public func disconnect() {
+        queued.removeAll()
         teardown()
         status = .idle
     }
@@ -192,6 +206,7 @@ public final class Remote {
     /// Starts pair-setup: the TV shows a PIN. Replaces any credentials once it succeeds.
     public func pair() {
         teardown()
+        attempt &+= 1
         open { [weak self] in
             guard let self else { return }
             self.phase = .pairStart
@@ -204,6 +219,7 @@ public final class Remote {
         guard case .pinEntry(let m2) = phase else { return }
         status = .pairing
         phase = .connecting   // nothing else may move the state machine while SRP runs
+        let token = attempt
         Task.detached(priority: .userInitiated) {
             let result: Result<(PairSetup, [UInt8]), ProtocolError>
             do throws(ProtocolError) {
@@ -213,11 +229,13 @@ public final class Remote {
                 result = .failure(error)
             }
             await MainActor.run { [weak self] in
-                guard let self else { return }
+                // The connection may have closed (or another attempt started) during SRP.
+                guard let self, self.attempt == token, self.conn != nil, case .connecting = self.phase else { return }
                 switch result {
                 case .success(let (ps, m3)):
                     self.phase = .pairM3(ps)
                     self.sendAuth(.pairSetupNext, m3, extra: ("_pwTy", 1))
+                    self.armTimeout(10)
                 case .failure(let e):
                     self.fail(e)
                 }
@@ -225,7 +243,7 @@ public final class Remote {
         }
     }
 
-    private func open(then: @escaping () -> Void) {
+    func open(then: @escaping () -> Void) {
         teardown()
         status = .connecting
         phase = .connecting
@@ -248,7 +266,7 @@ public final class Remote {
         c.start()
     }
 
-    private func teardown() {
+    func teardown() {
         stopMedia()
         timeout?.cancel()
         timeout = nil
@@ -262,31 +280,37 @@ public final class Remote {
         conn = nil
         phase = .idle
         replies.removeAll()
+        // Requests sent on this connection will never be answered now.
+        let lost = rawReplies.values
+        rawReplies.removeAll()
+        for w in lost { w.finish(nil, "disconnected") }
     }
 
-    private func fail(_ e: ProtocolError) {
+    /// A connect or pairing step failed. Queued commands stay (they expire by age), so a
+    /// press made while the TV wakes still lands after the quick retry.
+    func fail(_ e: ProtocolError) {
         Remote.log.error("\(self.device.name, privacy: .public): \(e.description, privacy: .public)")
-        queued.removeAll()
         teardown()
+        failStreak += 1
         switch e {
-        case .timeout, .connection: knock()
+        case .timeout, .connection, .notFound: if failStreak <= 3 { knock() }
         default: break
         }
-        status = .failed(e.description)
+        status = .failed(e)
     }
 
-    private func closed(_ err: ProtocolError?) {
+    func closed(_ err: ProtocolError?) {
         let wasSession = if case .session = phase { true } else { false }
         teardown()
         if wasSession {
             // Dropped while in use (TV slept, network blip): the owner reconnects.
-            status = .failed(err?.description ?? "disconnected")
+            status = .failed(err ?? .connection("disconnected"))
         } else {
             fail(err ?? .connection("the Apple TV closed the connection"))
         }
     }
 
-    private func armTimeout(_ seconds: Double) {
+    func armTimeout(_ seconds: Double) {
         timeout?.cancel()
         let item = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated { self?.fail(.timeout) }
@@ -297,7 +321,7 @@ public final class Remote {
 
     // MARK: - Pairing frames
 
-    private func sendAuth(_ type: FrameType, _ tlv: [UInt8], extra: (String, Int)?) {
+    func sendAuth(_ type: FrameType, _ tlv: [UInt8], extra: (String, Int)?) {
         var w = OPACK.Writer()
         w.dict(extra == nil ? 1 : 2)
         w.string("_pd")
@@ -306,25 +330,43 @@ public final class Remote {
         conn?.send(type, w.bytes)
     }
 
-    private func received(_ type: FrameType, _ payload: [UInt8]) {
+    func received(_ type: FrameType, _ payload: [UInt8]) {
         let msg: OPACK.Value
-        do { msg = try OPACK.decode(payload) } catch { return fail(error) }
+        do { msg = try OPACK.decode(payload) } catch {
+            // In a session, one message we can't read (a future tvOS tag) is dropped, not
+            // fatal: failing would reconnect into the same message forever.
+            if case .session = phase {
+                Remote.log.notice("dropped an unreadable message: \(error.description, privacy: .public)")
+                return
+            }
+            return fail(error)
+        }
         switch type {
         case .pairSetupNext, .pairVerifyNext:
+            switch phase {
+            case .verifying, .pairStart, .pairM3, .pairM5: break
+            default: return   // not expecting pairing: ignore rather than fail
+            }
             guard let pd = msg["_pd"]?.data else { return fail(.malformed("pairing reply without _pd")) }
             do { try auth(pd) } catch { fail(error) }
         case .encryptedOPACK, .unencryptedOPACK, .packedOPACK:
+            // Only once pair-verify has authenticated the TV and the frames are encrypted:
+            // before that, anything on the LAN answering for the TV's name could inject.
+            guard case .session = phase, conn?.isEncrypted == true else { return }
             message(msg)
         default:
             break
         }
     }
 
-    private func auth(_ pd: [UInt8]) throws(ProtocolError) {
+    func auth(_ pd: [UInt8]) throws(ProtocolError) {
         switch phase {
         case .verifying(var pv):
+            // Error 2 (authentication) means the TV no longer knows us; other codes (busy,
+            // back off) are passing: fail and retry as usual.
             if let code = try TLV8.decode(pd)[.error]?.first {
-                Remote.log.error("\(self.device.name, privacy: .public): pair-verify refused (\(code)): pairing lost")
+                guard code == 2 else { throw .authentication(TLV8.errorDescription(code)) }
+                Remote.log.error("\(self.device.name, privacy: .public): pair-verify refused: pairing lost")
                 queued.removeAll()
                 teardown()
                 status = .unpaired
@@ -349,6 +391,7 @@ public final class Remote {
             let m5 = try ps.m5(m4: pd, name: clientName)
             phase = .pairM5(ps)
             sendAuth(.pairSetupNext, m5, extra: ("_pwTy", 1))
+            armTimeout(10)
         case .pairM5(let ps):
             let creds = try ps.credentials(m6: pd)
             credentials = creds
@@ -362,7 +405,7 @@ public final class Remote {
 
     // MARK: - Session
 
-    private func startSession() {
+    func startSession() {
         timeout?.cancel()
         phase = .session
         let local = UInt64.random(in: 1...UInt64(UInt32.max))
@@ -391,7 +434,7 @@ public final class Remote {
             w.string("_srvT"); w.string("com.apple.tvremoteservices")
             w.string("_sid"); w.int(Int64(local))
         }) { [weak self] reply in
-            if let remote = reply["_c"]?["_sid"]?.int { self?.sid = UInt64(remote) << 32 | local }
+            if let remote = reply["_c"]?["_sid"]?.int { self?.sid = UInt64(UInt32(truncatingIfNeeded: remote)) << 32 | local }
         }
         // tvOS answers FetchAttentionState only after a TV Remote session is registered.
         request("TVRCSessionStart", count: 1) { w in
@@ -415,6 +458,7 @@ public final class Remote {
         status = .connected
         onTiming?("session", ContinuousClock.now - started)
         lastAnswer = .now
+        failStreak = 0
         if let h = conn?.remoteHost {
             lastHost = h
             UserDefaults.standard.set("\(h)", forKey: "host.\(device.name)")
@@ -428,10 +472,11 @@ public final class Remote {
         startMedia()
         let pending = queued
         queued.removeAll()
-        for f in pending { f() }
+        let now = ContinuousClock.now
+        for q in pending where now - q.at <= Remote.queueMaxAge { q.run() }
     }
 
-    private func message(_ msg: OPACK.Value) {
+    func message(_ msg: OPACK.Value) {
         onTrace?("← \(msg)")
         onMessage?(msg)
         switch msg["_t"]?.int {
@@ -462,12 +507,9 @@ public final class Remote {
             lastAnswer = .now
             let handler = replies.removeValue(forKey: Int(x))
             // Errors: `_em` (message) and/or `_ec`/`_ed` (code, domain; -6714 = not handled).
-            let error: String? = msg["_em"]?.string ?? msg["_ec"]?.int.map { code in
-                let c = code > 0x7FFF && code <= 0xFFFF ? code - 0x10000 : code
-                return "\(msg["_ed"]?.string ?? "error") \(c)"
-            }
+            let error: String? = msg["_em"]?.string ?? msg["_ec"]?.int.map { "\(msg["_ed"]?.string ?? "error") \($0)" }
             if let raw = rawReplies.removeValue(forKey: Int(x)) {
-                raw(error == nil ? msg : nil, error)
+                raw.finish(error == nil ? msg : nil, error)
                 return
             }
             if let error {
@@ -480,20 +522,21 @@ public final class Remote {
         }
     }
 
-    private func setTextSession(_ s: TextSession?) {
+    func setTextSession(_ s: TextSession?) {
         guard s != textSession else { return }
         textSession = s
         onTextSession?(s)
     }
 
-    private func systemStatus(_ s: Int64) {
+    func systemStatus(_ s: Int64) {
         // 1 asleep, 2 screensaver, 3 awake, 4 idle
         power = s == 1 ? .asleep : (s >= 2 && s <= 4 ? .awake : .unknown)
     }
 
     /// Writes `{_i, _t, _c: {count pairs}, _x}` and sends it encrypted.
-    private func send(_ identifier: String, type: Int, count: Int, _ content: (inout OPACK.Writer) -> Void,
-                      reply: ((OPACK.Value) -> Void)?, then done: (@MainActor () -> Void)? = nil) {
+    func send(_ identifier: String, type: Int, count: Int, _ content: (inout OPACK.Writer) -> Void,
+                      reply: ((OPACK.Value) -> Void)?, registered: ((Int) -> Void)? = nil,
+                      then done: (@MainActor () -> Void)? = nil) {
         guard let conn else { return }
         var w = OPACK.Writer(capacity: 96)
         w.dict(4)
@@ -504,387 +547,62 @@ public final class Remote {
         xid = (xid + 1) & 0x7FFF_FFFF
         w.string("_x"); w.int(x)
         if let reply { replies[x] = reply }
+        registered?(x)
         if type == 2 && (identifier == "_hidC" || identifier == "FetchMediaControlStatus") { track(x) }
         if let onTrace { onTrace("→ \((try? OPACK.decode(w.bytes)).map { "\($0)" } ?? "?")") }
         if let done { conn.send(.encryptedOPACK, w.bytes, then: done) } else { conn.send(.encryptedOPACK, w.bytes) }
     }
 
-    private func request(_ id: String, count: Int, _ content: (inout OPACK.Writer) -> Void,
+    func request(_ id: String, count: Int, _ content: (inout OPACK.Writer) -> Void,
                          reply: ((OPACK.Value) -> Void)? = nil) {
         send(id, type: 2, count: count, content, reply: reply)
     }
 
-    private func event(_ id: String, count: Int, _ content: (inout OPACK.Writer) -> Void) {
+    func event(_ id: String, count: Int, _ content: (inout OPACK.Writer) -> Void) {
         send(id, type: 1, count: count, content, reply: nil)
     }
 
-    /// Runs `f` now if connected, else after the (re)connect that this starts.
-    private func whenConnected(_ f: @escaping () -> Void) {
+    /// Runs `f` now if connected, else after the (re)connect that this starts (if it's
+    /// still young then). `release` commands (a button's "up") are always kept, so a full
+    /// queue can never strand a held button on the TV.
+    func whenConnected(release: Bool = false, _ f: @escaping () -> Void) {
         if case .session = phase { f(); return }
-        if queued.count < 16 { queued.append(f) }
-        if case .idle = phase, isPaired { connect() }
+        if release || queued.count < 16 { queued.append((ContinuousClock.now, f)) }
+        switch phase {
+        case .idle where isPaired: connect()
+        default: break
+        }
     }
 
-    /// The TV wants a MAC-address-like public id; derive a stable one from our key.
+    /// The TV wants a MAC-address-like public id; derive a stable one from our *public*
+    /// key (nothing derived from the private seed leaves the Mac).
     static func pubID(_ seed: [UInt8]) -> String {
-        let h = H(seed)
+        let pub = (try? Curve25519.Signing.PrivateKey(rawRepresentation: seed))?.publicKey.rawRepresentation
+        let h = H(Array(pub ?? Data()))
         return h.prefix(6).map { b in
             let s = String(b, radix: 16, uppercase: true)
             return s.count == 1 ? "0" + s : s
         }.joined(separator: ":")
     }
 
-    // MARK: - Reliability
+    // MARK: - MRP state (Remote+Media.swift)
 
-    /// A TV can keep the TCP connection while its remote service stops answering (seen by
-    /// other clients after hours). Presses and probes are tracked; one unanswered for 3 s
-    /// drops the session, discards queued presses (replaying them late would be worse than
-    /// losing them) and lets the owner reconnect.
-    static let deafAfter: Duration = .seconds(3)
+    /// Started with every session; a failure never affects the remote (buttons, text,
+    /// Companion now playing keep working) and is retried quietly with backoff.
+    var media: MediaRemote?
 
-    private func track(_ x: Int) {
-        awaiting[x] = .now
-        if deafCheck == nil { scheduleDeafCheck() }
-    }
+    var mediaRetry: DispatchWorkItem?
 
-    private func scheduleDeafCheck() {
-        let item = DispatchWorkItem { [weak self] in MainActor.assumeIsolated { self?.checkDeaf() } }
-        deafCheck = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: item)
-    }
+    var mediaFailures = 0
 
-    private func checkDeaf() {
-        deafCheck = nil
-        guard case .session = phase, let oldest = awaiting.values.min() else {
-            awaiting.removeAll()
-            return
-        }
-        if ContinuousClock.now - oldest > Remote.deafAfter {
-            Remote.log.error("\(self.device.name, privacy: .public): stopped answering; reconnecting")
-            queued.removeAll()
-            closed(.connection("the Apple TV stopped responding"))
-            return
-        }
-        scheduleDeafCheck()
-    }
+    var companionPlaying: NowPlaying?
 
-    /// Checks a session that's been quiet for a while (the window came forward): a cheap
-    /// request that must be answered, so a dead session is found before the user presses.
-    /// Not connected: connects.
-    public func probe() {
-        switch phase {
-        case .session:
-            guard ContinuousClock.now - lastAnswer > .seconds(15) else { return }
-            request("FetchMediaControlStatus", count: 0, { _ in }) { [weak self] reply in
-                guard let self, let f = reply["_c"]?["MediaControlFlags"]?.int, Int(f) != self.controls.rawValue else { return }
-                self.controls = MediaControls(rawValue: Int(f))
-                self.controlsKnown = true
-                self.onControls?(self.controls)
-            }
-        case .idle:
-            if isPaired { connect() }
-        default:
-            break
-        }
-    }
-
-    /// Drops the connection and makes a new one now (network changed, Mac woke).
-    public func reconnect() {
-        guard isPaired else { return }
-        switch phase {
-        case .pairStart, .pinEntry, .pairM3, .pairM5: return   // never interrupt pairing
-        default: break
-        }
-        teardown()
-        status = .idle
-        connect()
-    }
-
-    /// Closes the session the way Apple's remote does (`_sessionStop`), then disconnects.
-    /// `done` runs once the goodbye is on the wire (or right away when not connected).
-    public func goodbye(then done: @escaping @MainActor () -> Void = {}) {
-        guard case .session = phase else {
-            disconnect()
-            return done()
-        }
-        var finished = false
-        let finish: @MainActor () -> Void = { [weak self] in
-            guard !finished else { return }
-            finished = true
-            self?.disconnect()
-            done()
-        }
-        let s = sid
-        send("_sessionStop", type: 2, count: 2, { w in
-            w.string("_srvT"); w.string("com.apple.tvremoteservices")
-            w.string("_sid"); w.uint(s)
-        }, reply: nil, then: finish)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { MainActor.assumeIsolated { finish() } }
-    }
-
-    /// Wakes a TV whose address is known but that can't be reached: a sleeping Apple TV's
-    /// Bonjour records live on in a sleep proxy, which wakes it when someone connects to
-    /// one of its ports. Brief connection attempts, at most every 10 s.
-    private func knock() {
-        guard let host = lastHost, ContinuousClock.now - lastKnock > .seconds(10) else { return }
-        lastKnock = .now
-        for port: UInt16 in [49153, 7000, 3689, 49152, 32498] {
-            let c = NWConnection(host: host, port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
-            c.start(queue: .main)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { c.cancel() }
-        }
-    }
-
-    // MARK: - Commands
-
-    /// Any request, for exploring the protocol (`tvctl raw`). The reply (or nil on `_em`
-    /// error) goes to `reply` with the error text.
-    public func raw(_ id: String, _ content: [String: OPACK.Value], event: Bool = false,
-                    reply: ((OPACK.Value?, String?) -> Void)? = nil) {
-        whenConnected { [weak self] in
-            guard let self, let conn = self.conn else { return }
-            var w = OPACK.Writer()
-            w.dict(4)
-            w.string("_i"); w.string(id)
-            w.string("_t"); w.int(event ? 1 : 2)
-            w.string("_c"); w.value(.dict(content))
-            let x = self.xid
-            self.xid = (self.xid + 1) & 0x7FFF_FFFF
-            w.string("_x"); w.int(x)
-            if let reply { self.rawReplies[x] = reply }
-            self.onTrace?("→ \(id) \(content)")
-            conn.send(.encryptedOPACK, w.bytes)
-        }
-    }
-
-    /// Button down or up. Holding a button (down … up) behaves like holding the Siri
-    /// Remote's: scrolling repeats, long-press menus open.
-    public func button(_ b: Button, down: Bool) {
-        whenConnected { [weak self] in
-            self?.request("_hidC", count: 2) { w in
-                w.string("_hBtS"); w.int(down ? 1 : 2)
-                w.string("_hidC"); w.int(b.rawValue)
-            }
-        }
-    }
-
-    /// A click: down then up.
-    public func press(_ b: Button) {
-        button(b, down: true)
-        button(b, down: false)
-    }
-
-    /// Skips playback by `seconds` (negative = back).
-    public func skip(_ seconds: Double) {
-        whenConnected { [weak self] in
-            self?.request("_mcc", count: 2) { w in
-                w.string("_mcc"); w.int(7)
-                w.string("_skpS"); w.double(seconds)
-            }
-        }
-    }
-
-    /// Jumps to `seconds` into the playing item (as a relative skip from the current
-    /// extrapolated position; Companion has no absolute seek).
-    public func seek(to seconds: Double) {
-        if let m = media, m.isReady, m.supports(45) {
-            m.seek(to: seconds)
-            return
-        }
-        guard let np = nowPlaying else { return }
-        let delta = seconds - np.position()
-        guard abs(delta) >= 0.5 else { return }
-        skip(delta)
-        // Show the new position right away; the TV's own snapshot follows.
-        var moved = np
-        moved.elapsed = max(0, seconds)
-        moved.timestamp = Date().timeIntervalSinceReferenceDate
-        companionPlaying = moved
-        publishNowPlaying()
-    }
-
-    /// Mute toggle (HID Mute key over MRP); needs the AirPlay tunnel (`muteAvailable`).
-    public func toggleMute() {
-        media?.toggleMute()
-    }
-
-    public var muteAvailable: Bool { media?.isReady == true }
+    /// MRP ready / not (mute availability, now-playing source).
+    public var onMediaReady: ((Bool) -> Void)?
 
     /// Ask for now-playing artwork (MRP) while something shows it.
     public var wantsArtwork = false {
         didSet { media?.wantsArtwork = wantsArtwork }
     }
 
-    /// Whether the scrubber can move playback: MRP absolute seek, or Companion skips (the
-    /// TV's flags; assumed yes until it has said).
-    public var canSeek: Bool {
-        if let m = media, m.isReady, m.supports(45) { return true }
-        return !controlsKnown || controls.contains(.skipForward) || controls.contains(.skipBackward)
-    }
-
-    // MARK: - MRP (AirPlay tunnel)
-
-    /// Started with every session; a failure never affects the remote (buttons, text,
-    /// Companion now playing keep working) and is retried quietly with backoff.
-    private var media: MediaRemote?
-    private var mediaRetry: DispatchWorkItem?
-    private var mediaFailures = 0
-    private var companionPlaying: NowPlaying?
-    /// MRP ready / not (mute availability, now-playing source).
-    public var onMediaReady: ((Bool) -> Void)?
-
-    private func startMedia() {
-        guard media == nil, let credentials else { return }
-        let m = MediaRemote(device: device, credentials: credentials, name: clientName)
-        m.wantsArtwork = wantsArtwork
-        media = m
-        m.onReady = { [weak self, weak m] ok in
-            guard let self, let m, m === self.media else { return }
-            if ok { self.mediaFailures = 0 }
-            Remote.log.info("\(self.device.name, privacy: .public): MRP \(ok ? "ready" : "down", privacy: .public)")
-            self.onMediaReady?(ok)
-            self.publishNowPlaying()
-        }
-        m.onNowPlaying = { [weak self, weak m] _ in
-            guard let self, let m, m === self.media else { return }
-            self.publishNowPlaying()
-        }
-        m.onTunnel = { [weak self, weak m] s in
-            guard let self, let m, m === self.media, case .failed(let e) = s else { return }
-            Remote.log.notice("AirPlay tunnel: \(e, privacy: .public)")
-            self.scheduleMediaRetry()
-        }
-        m.start()
-    }
-
-    private func scheduleMediaRetry() {
-        mediaRetry?.cancel()
-        let delays: [Double] = [2, 5, 15, 30, 60]
-        let delay = delays[min(mediaFailures, delays.count - 1)]
-        mediaFailures += 1
-        let item = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self, case .session = self.phase, let m = self.media else { return }
-                m.start()
-            }
-        }
-        mediaRetry = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
-    }
-
-    private func stopMedia() {
-        mediaRetry?.cancel()
-        mediaRetry = nil
-        let had = media?.isReady == true
-        media?.onReady = nil
-        media?.onNowPlaying = nil
-        media?.onTunnel = nil
-        media?.stop()
-        media = nil
-        if had { onMediaReady?(false) }
-    }
-
-    /// MRP's now playing when the tunnel is up (every app reports to it), else Companion's;
-    /// subtitle availability/state always from Companion (MRP doesn't carry it simply).
-    private func publishNowPlaying() {
-        var np = media?.isReady == true ? media?.nowPlaying : companionPlaying
-        if var n = np, let c = companionPlaying {
-            if !n.captionsFromMRP {
-                n.captionsEnabled = c.captionsEnabled
-                n.hasCaptions = c.hasCaptions
-            }
-            n.bundleID = n.bundleID ?? c.bundleID
-            np = n
-        }
-        guard np != nowPlaying else { return }
-        nowPlaying = np
-        onNowPlaying?(np)
-    }
-
-    /// Asks for a fresh now-playing snapshot (arrives via `onNowPlaying`).
-    public func refreshNowPlaying() {
-        guard case .session = phase else { return }
-        media?.refresh()
-        request("FetchCurrentNowPlayingInfoEvent", count: 0) { _ in }
-    }
-
-    /// Subtitles on/off for the playing item: Companion `ToggleCaptions`, which is what
-    /// Apple's own remote sends. (MRP EnableLanguageOption looked cleaner but replaced the
-    /// item's whole media selection on the owner's TV: audio went silent. Don't use it.)
-    /// The resulting state shows up through now playing (MRP language options when the
-    /// app publishes them, else Companion's flags).
-    public func toggleCaptions() {
-        whenConnected { [weak self] in
-            self?.request("ToggleCaptions", count: 0) { _ in
-                // The TV doesn't always push a new snapshot after a toggle: ask.
-                self?.refreshNowPlaying()
-            }
-        }
-    }
-
-    /// Edits the focused TV text field: `delete` characters before the cursor, then type
-    /// `insert`. See `RTI.diff` for turning a local field change into an edit.
-    public func editText(delete: Int, insert: String) {
-        guard delete > 0 || !insert.isEmpty else { return }
-        sendText(textSession.map { RTI.edit(session: $0.uuid, delete: delete, insert: insert) })
-    }
-
-    /// Replaces the focused TV text field's whole contents.
-    public func setText(_ text: String) {
-        sendText(textSession.map { RTI.replace(session: $0.uuid, with: text) })
-    }
-
-    private func sendText(_ ops: [UInt8]?) {
-        guard let ops, case .session = phase else { return }
-        event("_tiC", count: 2) { w in
-            w.string("_tiV"); w.int(1)
-            w.string("_tiD"); w.data(ops)
-        }
-    }
-
-    public func wake() {
-        whenConnected { [weak self] in
-            self?.request("_hidC", count: 2) { w in
-                w.string("_hBtS"); w.int(2)
-                w.string("_hidC"); w.int(Button.wake.rawValue)
-            }
-        }
-        power = .awake
-    }
-
-    public func sleep() {
-        whenConnected { [weak self] in
-            self?.request("_hidC", count: 2) { w in
-                w.string("_hBtS"); w.int(2)
-                w.string("_hidC"); w.int(Button.sleep.rawValue)
-            }
-        }
-        power = .asleep
-    }
-
-    public func togglePower() {
-        if power == .asleep { wake() } else { sleep() }
-    }
-
-    public func launch(bundleID: String) {
-        whenConnected { [weak self] in
-            self?.request("_launchApp", count: 1) { w in
-                w.string("_bundleID"); w.string(bundleID)
-            }
-        }
-    }
-
-    /// Touch surface (1000×1000): phase 1 press, 3 hold/move, 4 release, 5 click.
-    public func touch(x: Double, y: Double, phase: Int) {
-        guard case .session = self.phase else { return }
-        let (sec, atto) = (ContinuousClock.now - started).components
-        let ns = sec * 1_000_000_000 + atto / 1_000_000_000
-        event("_hidT", count: 5) { w in
-            w.string("_ns"); w.int(max(0, ns))
-            w.string("_tFg"); w.int(1)
-            w.string("_cx"); w.int(Int64(min(1000, max(0, x))))
-            w.string("_tPh"); w.int(phase)
-            w.string("_cy"); w.int(Int64(min(1000, max(0, y))))
-        }
-    }
 }

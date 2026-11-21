@@ -16,29 +16,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     lazy var view = RemoteView()
     var store = CredentialStore()
     var remote: Remote?
-    private var pairer: Remote?
+    var pairer: Remote?
     var devices: [Device] = []
-    private var browser: Browser?
-    private let mediaKeys = MediaKeys()
-    private var heldKeys: [UInt16: Button] = [:]
-    private var control: ControlServer?
-    private let root = Flipped()
+    var browser: Browser?
+    let mediaKeys = MediaKeys()
+    var heldKeys: [UInt16: Button] = [:]
+    var control: ControlServer?
+    let root = Flipped()
 
     // MARK: Sidebar state (see Sidebar.swift)
-    private var sidebar: Sidebar?
-    private(set) var sidebarOpen = false
-    private var tvApps: [TVApp]?
-    private var loadingApps = false
-    private var upNext: [UpNextItem]?
+    var sidebar: Sidebar?
+    var sidebarOpen = false
+    var tvApps: [TVApp]?
+    var loadingApps = false
+    var upNext: [UpNextItem]?
 
     func sidebarTab(_ t: Int) {
         sidebar?.tab = t
         UserDefaults.standard.set(t, forKey: "sidebarTab")
     }
-    private var retryCount = 0
-    private var retryItem: DispatchWorkItem?
+    var retryCount = 0
+    var retryItem: DispatchWorkItem?
 
     static let log = Logger(subsystem: "com.lingrino.remotetv", category: "app")
+
+    // State for the extensions (AppDelegate+*.swift).
+    var renameProbe: Remote?
+    var lastRenameProbe = Date.distantPast
+    /// Candidates already tried since the TV went missing (each gets one try per streak).
+    var renameTried: Set<String> = []
 
     /// Runs in `main` before AppKit starts (NSApplication.shared alone takes ~50 ms):
     /// the TCP connection and mDNS lookup proceed while AppKit initializes, and
@@ -107,8 +113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         return false
     }
 
-    private static let idleDisconnect: Double = 600
-    private var idleItem: DispatchWorkItem?
+    static let idleDisconnect: Double = 600
+    var idleItem: DispatchWorkItem?
 
     func show() {
         idleItem?.cancel()
@@ -120,19 +126,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         remote?.probe()
         remote?.refreshNowPlaying()
         updateTicker()
+        browse()
         if sidebarOpen { remote?.wantsArtwork = true; loadSidebar() }
     }
 
     func hide() {
-        releaseAll()
         window.orderOut(nil)
+        NSApp.hide(nil)
+        wentAway()
+    }
+
+    /// The window is out of sight (closed, ⌘H, hidden by tvctl): stop everything that
+    /// only serves what's on screen, and drop the connection after `idleDisconnect`.
+    func wentAway() {
+        releaseAll()
         updateTicker()
         remote?.wantsArtwork = false
-        NSApp.hide(nil)
+        browser?.stop()
+        browser = nil
+        armIdle()
+    }
+
+    /// (Re)starts the hidden-window countdown: also after a tvctl command reconnected
+    /// while hidden, so that session ends too.
+    func armIdle() {
         idleItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, !self.window.isVisible else { return }
+                guard let self, !self.window.isVisible || NSApp.isHidden else { return }
                 self.retryItem?.cancel()
                 self.remote?.goodbye()
                 self.pairer?.disconnect()
@@ -140,6 +161,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         idleItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + AppDelegate.idleDisconnect, execute: item)
+    }
+
+    func applicationDidHide(_ note: Notification) { wentAway() }
+
+    func applicationDidUnhide(_ note: Notification) {
+        if window?.isVisible == true { show() }
     }
 
     func applicationDidBecomeActive(_ note: Notification) {
@@ -159,26 +186,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     /// Mac sleep: close the session cleanly and don't retry while asleep; wake: a fresh
     /// connection (the old socket may be half-open after the network went away).
-    @objc private func willSleep() {
+    @objc func willSleep() {
         retryItem?.cancel()
         sleeping = true
         remote?.goodbye()
     }
 
-    @objc private func didWake() {
+    @objc func didWake() {
         sleeping = false
         guard window?.isVisible == true else { return }
         remote?.reconnect()
     }
 
-    private var sleeping = false
-    private var pathMonitor: NWPathMonitor?
-    private var pathSignature: String?
+    var sleeping = false
+    var pathMonitor: NWPathMonitor?
+    var pathSignature: String?
 
     /// Network changes (Wi-Fi to Ethernet, another network, VPN up/down) leave the TCP
     /// connections on a dead path; keepalive would notice only after ~20 s. Reconnect
     /// right away instead, and as soon as a network comes back after none.
-    private func watchNetwork() {
+    func watchNetwork() {
         let m = NWPathMonitor()
         m.pathUpdateHandler = { [weak self] path in
             let sig = "\(path.status) " + path.availableInterfaces.map(\.name).joined(separator: ",")
@@ -190,47 +217,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         pathMonitor = m
     }
 
-    private func networkChanged(_ sig: String, satisfied: Bool) {
+    func networkChanged(_ sig: String, satisfied: Bool) {
         defer { pathSignature = sig }
         guard let old = pathSignature, old != sig, satisfied, !sleeping else { return }
-        AppDelegate.log.info("network changed; reconnecting")
         guard window?.isVisible == true || remote?.status == .connected else { return }
+        // A probe, not a reconnect: a VPN or a second interface coming up leaves the LAN
+        // path working; if it doesn't, the unanswered probe drops the session in 3 s.
+        AppDelegate.log.info("network changed; checking the session")
         retryCount = 0
-        remote?.reconnect()
+        remote?.probe(force: true)
     }
 
     // MARK: - URLs
 
-    /// `remotetv://` URLs, for scripting (Fred, Shortcuts, `open`) and live testing:
-    ///   remotetv://show · remotetv://hide
-    ///   remotetv://press/<button>[/<button>…]   (up down left right select menu home playpause volumeup volumedown)
-    ///   remotetv://skip/<seconds>               (negative = back)
-    ///   remotetv://sleep · remotetv://wake
+    /// `remotetv://show`, `remotetv://hide`, `remotetv://sidebar`. Any app or web page can
+    /// open a URL, so the scheme only does harmless window things; everything that acts on
+    /// the TV or the disk goes through tvctl (the owner-only control socket).
     func application(_ application: NSApplication, open urls: [URL]) {
+        guard window != nil else { return }   // cold launch: the window is about to show anyway
         for url in urls where url.scheme == "remotetv" {
-            let parts = [url.host() ?? ""] + url.pathComponents.filter { $0 != "/" }
-            switch parts.first {
+            switch url.host() {
             case "show": show()
             case "hide": hide()
-            case "press":
-                for name in parts.dropFirst() {
-                    if let b = Button.named(name) { remote?.press(b) }
-                }
-            case "skip": if let s = parts.dropFirst().first.flatMap(Double.init) { remote?.skip(s) }
-            case "snapshot":
-                // Debug: PNG of the window content (glass doesn't render offscreen).
-                let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "path" }?.value
-                let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-                if q.contains(where: { $0.name == "controls" }) { view.showsPairing = false }
-                if let a = q.first(where: { $0.name == "appearance" })?.value {
-                    window.appearance = a == "system" ? nil : NSAppearance(named: a == "dark" ? .darkAqua : .aqua)
-                }
-                if let path { snapshot(to: path) }
-            case "pairing": startPairing()
             case "sidebar": toggleSidebar()
-            case "sleep": remote?.sleep()
-            case "wake": remote?.wake()
-            default: AppDelegate.log.notice("unknown URL \(url.absoluteString, privacy: .public)")
+            default: AppDelegate.log.notice("unknown URL \(url.absoluteString, privacy: .private)")
             }
         }
     }
@@ -243,7 +253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     // MARK: - Window
 
-    private func buildWindow() {
+    func buildWindow() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: Theme.width, height: RemoteView.height),
                           styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
@@ -269,6 +279,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.setFrameAutosaveName("Remote")
 
         view.onKey = { [weak self] e, down in self?.key(e, down: down) ?? false }
+        // Keys held on the TV must be let go when the remote stops getting key events:
+        // focus moved into the text field, or ⌘ went down (AppKit sends no key-up for a
+        // key released while ⌘ is held).
+        view.onResign = { [weak self] in self?.releaseAll() }
+        view.onFlags = { [weak self] e in if e.modifierFlags.contains(.command) { self?.releaseAll() } }
         view.title.target = self
         view.title.action = #selector(showDeviceMenu)
         view.sidebarButton.target = self
@@ -278,7 +293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if self?.remote?.nowPlaying?.hasCaptions == true { self?.remote?.toggleCaptions() }
         }
         view.strip.onStatusClick = { [weak self] in
-            guard self?.remote?.status == .failed(ProtocolError.localNetworkDenied.description) else { return }
+            guard self?.remote?.status == .failed(.localNetworkDenied) else { return }
             NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork")!)
         }
         view.strip.onSeek = { [weak self] t in self?.remote?.seek(to: t) }
@@ -320,13 +335,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// Makes `name` the controlled Apple TV and connects.
     func use(_ name: String, _ creds: Credentials) {
         remote?.disconnect()
+        if remote?.device.name != name {   // another TV: its apps and Up Next aren't these
+            tvApps = nil
+            upNext = nil
+            sidebar?.setApps(nil)
+            sidebar?.setUpNext(nil)
+        }
         let r = makeRemote(device(named: name), creds)
         remote = r
         showRemote(r)
         r.connect()
     }
 
-    private func makeRemote(_ device: Device, _ creds: Credentials) -> Remote {
+    func makeRemote(_ device: Device, _ creds: Credentials) -> Remote {
         retryItem?.cancel()
         retryCount = 0
         let r = Remote(device: device, credentials: creds)
@@ -335,7 +356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     /// Routes a session's callbacks here (only while it is the current remote).
-    private func adopt(_ r: Remote) {
+    func adopt(_ r: Remote) {
         r.onStatus = { [weak self, weak r] s in
             guard let self, let r, r === self.remote else { return }
             self.statusChanged(s)
@@ -366,213 +387,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
-    private func showRemote(_ r: Remote) {
+    func showRemote(_ r: Remote) {
         view.showsPairing = false
         window.makeFirstResponder(view)
         updateHeader()
     }
 
-    private func device(named name: String) -> Device {
+    func device(named name: String) -> Device {
         devices.first { $0.name == name } ?? Device(name: name)
     }
 
-    private func statusChanged(_ s: Remote.Status) {
+    func statusChanged(_ s: Remote.Status) {
         guard window != nil else { return }   // still launching: the window shows the state when it's built
         updateHeader()
         switch s {
         case .connected:
             retryCount = 0
+            renameTried.removeAll()
             if let name = remote?.device.name, store.last != name { try? store.touch(name) }
         case .failed(let e):
             scheduleRetry()
-            if e.hasPrefix("couldn't find") || e == ProtocolError.timeout.description { followRename() }
+            if e == .notFound || e == .timeout { followRename() }
         default:
             break
         }
-    }
-
-    // MARK: - Sidebar
-
-    @objc func toggleSidebar() { setSidebar(!sidebarOpen, animate: true) }
-
-    /// Opens or closes the sidebar by widening the window to the right (the remote stays
-    /// where it is; near the screen's right edge the window shifts left to fit).
-    func setSidebar(_ open: Bool, animate: Bool) {
-        guard open != sidebarOpen, let window else { return }
-        sidebarOpen = open
-        UserDefaults.standard.set(open, forKey: "sidebarOpen")
-        let h = RemoteView.height
-        let width = open ? Theme.width + Sidebar.width + Sidebar.inset : Theme.width
-        if open {
-            let s = sidebar ?? makeSidebar()
-            s.isHidden = false
-        }
-        var f = window.frame
-        f.size.width = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: width, height: h)).width
-        if open, let vis = window.screen?.visibleFrame, f.maxX > vis.maxX { f.origin.x = max(vis.minX, vis.maxX - f.width) }
-        window.setFrame(f, display: true, animate: animate)
-        root.frame = NSRect(x: 0, y: 0, width: width, height: h)
-        if !open { sidebar?.isHidden = true }
-        view.sidebarButton.contentTintColor = open ? .labelColor : .secondaryLabelColor
-        remote?.wantsArtwork = open && window.isVisible
-        if open { loadSidebar() }
-    }
-
-    private func makeSidebar() -> Sidebar {
-        let s = Sidebar(frame: NSRect(x: Theme.width, y: Sidebar.inset, width: Sidebar.width,
-                                      height: RemoteView.height - 2 * Sidebar.inset))
-        s.onPlay = { [weak self] item in
-            guard let url = item.actionURL else { return }
-            self?.remote?.open(url: url)
-        }
-        s.onLaunch = { [weak self] app in self?.remote?.launch(bundleID: app.bundleID) }
-        s.onTab = { UserDefaults.standard.set($0, forKey: "sidebarTab") }
-        s.tab = UserDefaults.standard.integer(forKey: "sidebarTab")
-        root.addSubview(s)
-        sidebar = s
-        return s
-    }
-
-    /// Fresh Up Next every time it's shown (it changes as you watch); apps (with icons)
-    /// once per run, unless the installed set changed.
-    private func loadSidebar() {
-        guard let r = remote, let s = sidebar else { return }
-        s.setNowPlaying(r.nowPlaying, app: app(for: r.nowPlaying?.bundleID))
-        r.fetchUpNext { [weak self] items in
-            guard let self else { return }
-            if let items { self.upNext = items }
-            // A failed fetch keeps what was there (the TV's Up Next service has hiccups).
-            self.sidebar?.setUpNext(items ?? self.upNext, failed: items == nil && self.upNext == nil)
-        }
-        if tvApps == nil { s.setApps(nil) } else { s.setApps(tvApps) }
-        guard !loadingApps else { return }
-        loadingApps = true
-        r.fetchApps(icons: false) { [weak self] names in
-            guard let self else { return }
-            if let have = self.tvApps, Set(have.map(\.bundleID)) == Set(names.map(\.bundleID)) {
-                self.loadingApps = false
-                return
-            }
-            r.fetchApps(icons: true) { [weak self] apps in
-                guard let self else { return }
-                self.loadingApps = false
-                self.tvApps = apps
-                self.sidebar?.setApps(apps)
-                self.sidebar?.setNowPlaying(r.nowPlaying, app: self.app(for: r.nowPlaying?.bundleID))
-            }
-        }
-    }
-
-    private func app(for bundleID: String?) -> TVApp? {
-        guard let bundleID else { return nil }
-        return tvApps?.first { $0.bundleID == bundleID }
-    }
-
-    // MARK: - Renamed TVs
-
-    private var renameProbe: Remote?
-    private var lastRenameProbe = Date.distantPast
-
-    /// Pairings are stored by the TV's name, which is also how it's found (Bonjour). If
-    /// the TV was renamed, the old name is gone; any Apple TV on the network whose name
-    /// isn't paired is tried with the current credentials: pair-verify only succeeds on
-    /// the TV that holds them (it proves its identity), and then the pairing moves over.
-    private func followRename() {
-        guard renameProbe == nil, Date().timeIntervalSince(lastRenameProbe) > 30,
-              let r = remote, let creds = r.credentials else { return }
-        let paired = Set(store.entries.map(\.name))
-        guard let candidate = devices.first(where: { !paired.contains($0.name) }) else { return }
-        lastRenameProbe = Date()
-        let old = r.device.name
-        let p = Remote(device: candidate, credentials: creds)
-        renameProbe = p
-        p.onStatus = { [weak self, weak p] s in
-            guard let self, let p, p === self.renameProbe else { return }
-            switch s {
-            case .connected:
-                AppDelegate.log.notice("\(old, privacy: .public) is now \(candidate.name, privacy: .public)")
-                self.renameProbe = nil
-                try? self.store.remove(old)
-                try? self.store.save(candidate.name, creds)
-                self.remote?.disconnect()
-                self.remote = p
-                self.adopt(p)
-                self.showRemote(p)
-                self.statusChanged(s)
-            case .failed, .unpaired:
-                self.renameProbe = nil
-                p.disconnect()
-            default:
-                break
-            }
-        }
-        p.connect()
-    }
-
-    /// Reconnects after a failure while the app is in use: quickly at first (a TV that
-    /// just woke up), then backing off to every 8 s.
-    private func scheduleRetry() {
-        retryItem?.cancel()
-        guard window?.isVisible == true, remote?.isPaired == true else { return }
-        let delays: [Double] = [0.3, 1, 2, 4, 8]
-        let delay = delays[min(retryCount, delays.count - 1)]
-        retryCount += 1
-        let item = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated { self?.remote?.connect() }
-        }
-        retryItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
-    }
-
-    private func reconnectIfNeeded(now: Bool = false) {
-        guard let r = remote, r.isPaired else { return }
-        switch r.status {
-        case .failed, .idle:
-            retryItem?.cancel()
-            retryCount = 0
-            r.connect()
-        default:
-            break
-        }
-    }
-
-    private func updateHeader() {
-        guard window != nil else { return }
-        guard let r = remote, !view.showsPairing else {
-            view.title.title = "RemoteTV"
-            return
-        }
-        view.title.title = r.device.name
-        let status: String? = switch r.status {
-        case .connected, .idle: nil
-        case .connecting, .pairing: "Connecting…"
-        case .unpaired: "\(r.device.name) forgot this Mac. Pair again from the menu above."
-        case .failed(let e) where e == ProtocolError.localNetworkDenied.description:
-            "Local Network access is off. Click to allow it."
-        case .waitingForPIN: "Pairing…"
-        case .failed(let e): e.prefix(1).uppercased() + e.dropFirst()
-        }
-        view.strip.show(status == nil ? r.nowPlaying : nil, status: status, seekable: r.canSeek)
-        view.setPower(asleep: r.power == .asleep)
-        if sidebarOpen { sidebar?.setNowPlaying(status == nil ? r.nowPlaying : nil, app: app(for: r.nowPlaying?.bundleID)) }
-        let known = r.controlsKnown && r.status == .connected
-        let volume = !known || r.controls.contains(.volume)
-        view.setAvailability(skip: !known || r.controls.contains(.skipForward) || r.controls.contains(.skipBackward),
-                             volume: volume)
-        view.volume.muteAvailable = r.muteAvailable && volume
-        let np = r.nowPlaying
-        view.setCaptions(available: np?.hasCaptions ?? false, on: np?.captionsEnabled ?? false)
-        updateTicker()
     }
 
     // MARK: - Now playing and text
 
-    private var ticker: Timer?
+    var ticker: Timer?
 
     /// Moves the scrubber while something plays and the window is visible (2 Hz; the
     /// position is extrapolated locally, nothing is sent).
-    private func updateTicker() {
-        let run = window?.isVisible == true && remote?.nowPlaying?.isPlaying == true && remote?.status == .connected
+    func updateTicker() {
+        let run = window?.isVisible == true && !NSApp.isHidden && remote?.nowPlaying?.isPlaying == true && remote?.status == .connected
         if run && ticker == nil {
             let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
@@ -590,9 +438,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     /// What the TV field holds as far as we know (its reported text plus our edits).
-    private var sentText = ""
+    var sentText = ""
 
-    private func textSessionChanged(_ s: TextSession?) {
+    func textSessionChanged(_ s: TextSession?) {
         guard window != nil else { return }
         if let s {
             sentText = s.text
@@ -607,227 +455,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
-    // MARK: - Device menu and browsing
-
-    private func browse() {
-        guard browser == nil else { return }
-        let b = Browser { [weak self] found in
-            guard let self else { return }
-            self.devices = found
-            if self.view.showsPairing && self.pairer == nil { self.showDeviceList() }
-        }
-        browser = b
-        b.start()
-    }
-
-    @objc private func showDeviceMenu() {
-        let menu = NSMenu()
-        let current = remote?.device.name
-        var names = store.entries.map(\.name)
-        for d in devices where !names.contains(d.name) { names.append(d.name) }
-        for name in names {
-            let item = NSMenuItem(title: name, action: #selector(menuPick(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = name
-            item.state = name == current ? .on : .off
-            let lost = name == current && remote?.status == .unpaired
-            if store.credentials(for: name) == nil || lost { item.title = "\(name) — Pair Again…" }
-            menu.addItem(item)
-        }
-        if names.isEmpty {
-            let item = NSMenuItem(title: "Looking for Apple TVs…", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        }
-        menu.addItem(.separator())
-        let pairItem = NSMenuItem(title: "Pair Another Apple TV…", action: #selector(startPairingAction), keyEquivalent: "")
-        pairItem.target = self
-        menu.addItem(pairItem)
-        if let current, store.credentials(for: current) != nil {
-            let forget = NSMenuItem(title: "Forget “\(current)”", action: #selector(forgetCurrent), keyEquivalent: "")
-            forget.target = self
-            menu.addItem(forget)
-        }
-        let b = view.title
-        menu.popUp(positioning: nil, at: NSPoint(x: b.bounds.midX - 60, y: b.bounds.maxY + 4), in: b)
-    }
-
-    @objc private func menuPick(_ item: NSMenuItem) {
-        guard let name = item.representedObject as? String else { return }
-        if name == remote?.device.name, remote?.status == .unpaired { return pair(name) }
-        if let creds = store.credentials(for: name) { use(name, creds) } else { pair(name) }
-    }
-
-    @objc private func forgetCurrent() {
-        guard let name = remote?.device.name else { return }
-        try? store.remove(name)
-        remote?.disconnect()
-        remote = nil
-        if let next = store.last, let creds = store.credentials(for: next) { use(next, creds) } else { startPairing() }
-    }
-
-    // MARK: - Pairing
-
-    @objc private func startPairingAction() { startPairing() }
-
-    private func startPairing() {
-        pairer?.disconnect()
-        pairer = nil
-        view.showsPairing = true
-        updateHeader()
-        showDeviceList()
-        browse()
-    }
-
-    private func showDeviceList() {
-        view.pairing.showDevices(devices.map(\.name), paired: Set(store.entries.map(\.name)))
-    }
-
-    private func pair(_ name: String) {
-        view.showsPairing = true
-        updateHeader()
-        let p = Remote(device: device(named: name), credentials: nil)
-        p.onStatus = { [weak self, weak p] s in
-            guard let self, let p, p === self.pairer else { return }
-            self.pairingStatus(p, s)
-        }
-        p.onPaired = { [weak self] creds in
-            guard let self else { return }
-            do { try self.store.save(name, creds) } catch {
-                AppDelegate.log.error("saving pairing: \(error.localizedDescription, privacy: .public)")
-            }
-        }
-        pairer = p
-        view.pairing.showWorking("Connecting to “\(name)”…")
-        view.pairing.heading.stringValue = "Pairing"
-        p.pair()
-    }
-
-    private func pairingStatus(_ p: Remote, _ s: Remote.Status) {
-        // Paired: from here on this session is the remote (connected, or failing to
-        // connect, which the normal retry handles).
-        if p.credentials != nil, s == .connected || s.isFailure {
-            pairer = nil
-            remote?.disconnect()
-            remote = p
-            adopt(p)
-            showRemote(p)
-            statusChanged(s)
-            return
-        }
-        switch s {
-        case .waitingForPIN:
-            view.pairing.showPIN(for: p.device.name, error: nil)
-        case .pairing:
-            view.pairing.showWorking("Pairing…")
-        case .failed(let e):
-            view.pairing.showPIN(for: p.device.name, error: e.prefix(1).uppercased() + e.dropFirst())
-            view.pairing.pin.isEnabled = false
-            view.pairing.detail.stringValue += " Choose the Apple TV to try again."
-            pairer = nil
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-                guard let self, self.pairer == nil, self.view.showsPairing else { return }
-                self.showDeviceList()
-            }
-        default:
-            break
-        }
-    }
-
-    @objc private func pinChanged() {
-        let digits = view.pairing.pin.stringValue.filter(\.isNumber)
-        if digits != view.pairing.pin.stringValue { view.pairing.pin.stringValue = String(digits.prefix(4)) }
-        if digits.count == 4 { pinEntered() }
-    }
-
-    @objc private func pinEntered() {
-        let digits = view.pairing.pin.stringValue.filter(\.isNumber)
-        guard digits.count == 4, let p = pairer, p.status == .waitingForPIN else { return }
-        p.submitPIN(digits)
-    }
-
-    @objc private func cancelPairing() {
-        pairer?.disconnect()
-        pairer = nil
-        if remote != nil {
-            view.showsPairing = false
-            window.makeFirstResponder(view)
-            updateHeader()
-        } else {
-            showDeviceList()
-        }
-    }
-
-    // MARK: - Keyboard
-
-    /// Remote keys while the window is key. Arrows/Return/Delete/Space/T are held like the
-    /// Siri Remote's buttons (down on key down, up on key up); [ ] skip; - = volume.
-    private func key(_ e: NSEvent, down: Bool) -> Bool {
-        guard let r = remote, !view.showsPairing else { return false }
-        if e.modifierFlags.contains(.command) { return false }
-        let code = e.keyCode
-        if code == 48, down, !view.text.isHidden {   // Tab: back into the TV's text field
-            window.makeFirstResponder(view.text.field)
-            return true
-        }
-        let held: Button? = switch code {
-        case 126: .up
-        case 125: .down
-        case 123: .left
-        case 124: .right
-        case 36, 76: .select           // Return, keypad Enter
-        case 51, 53, 117: .menu        // Delete, Escape, forward delete
-        case 49: .playPause            // Space
-        case 17, 4: .home              // T, H
-        default: nil
-        }
-        if let b = held {
-            if down {
-                if !e.isARepeat && heldKeys[code] == nil {
-                    heldKeys[code] = b
-                    r.button(b, down: true)
-                }
-            } else if let b = heldKeys.removeValue(forKey: code) {
-                r.button(b, down: false)
-            }
-            return true
-        }
-        guard down else { return code == 33 || code == 30 || code == 27 || code == 24 }
-        switch code {
-        case 33: if !e.isARepeat { r.skip(-10) }   // [
-        case 30: if !e.isARepeat { r.skip(10) }    // ]
-        case 27: r.press(.volumeDown)               // -
-        case 24: r.press(.volumeUp)                 // =
-        default: return false
-        }
-        return true
-    }
-
-    /// Lets go of every held key and click (focus moved away mid-press).
-    private func releaseAll() {
-        for (_, b) in heldKeys { remote?.button(b, down: false) }
-        heldKeys.removeAll()
-        view.pad.cancel()
-    }
-
-    /// Volume/play keys while RemoteTV is active. Returns false for keys it leaves to
-    /// macOS (mute).
-    private func mediaKey(_ key: MediaKeys.Key, down: Bool, repeat rep: Bool) -> Bool {
-        guard let r = remote else { return false }
-        switch key {
-        case .volumeUp: if down { r.press(.volumeUp) }
-        case .volumeDown: if down { r.press(.volumeDown) }
-        case .playPause: if down && !rep { r.press(.playPause) }
-        case .next, .fast: if down && !rep { r.skip(10) }
-        case .previous, .rewind: if down && !rep { r.skip(-10) }
-        case .mute: return false
-        }
-        return true
-    }
-
     // MARK: - Menu
 
-    private func buildMenu() {
+    func buildMenu() {
         let main = NSMenu()
         let appItem = NSMenuItem()
         main.addItem(appItem)

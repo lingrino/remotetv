@@ -20,19 +20,22 @@ This file is the agent guide (Claude Code reads it when there is no CLAUDE.md; d
 - Single user, one Apple TV most of the time (a couple more when traveling). No config.
 - A window you can drag around (not a menu-bar extra), launched from Fred (the owner's
   launcher). Launching it again must show it immediately.
-- Local git repo only for now (no remote, no CI, no releases).
+- Local git repo at first; the owner is about to publish it on GitHub (no CI/releases yet).
 
-Round 5 (2026-11-21): "very thorough and reliable" pass (see Reliability). The main view
+Round 6 (2026-11-20): an independent full review (another model, all files) before going
+public on GitHub; its findings were fixed (see Security and Reliability). Next: publish.
+
+Round 5 (2026-11-20): "very thorough and reliable" pass (see Reliability). The main view
 stays exactly as simple as it is — no artwork or lists there; those live in a sidebar that
 slides out on demand (the owner left its design to the agent: "care about design… make
 something great"). tvctl ships inside the app, lands on the PATH by itself, and talks
 through the app's connection.
 
-Round 4 (2026-11-21): mute, scrubbing and now playing confirmed working. MRP subtitles
+Round 4 (2026-11-20): mute, scrubbing and now playing confirmed working. MRP subtitles
 broke audio (see Protocol notes) — reverted to Companion ToggleCaptions. No placeholder in
 the text bar; no hover text (tooltips) anywhere — keep it that way.
 
-Round 3 (2026-11-21): text bar redesigned (glass capsule), ⌘C/⌘X/⌘Z, typing sent as
+Round 3 (2026-11-20): text bar redesigned (glass capsule), ⌘C/⌘X/⌘Z, typing sent as
 delete/insert edits (YouTube doesn't report its field's text, so replace wiped it). The
 owner accepted building the AirPlay/MRP tunnel "only if very reliable and unnoticeable":
 it starts after every Companion session, never blocks the remote, retries quietly
@@ -80,10 +83,10 @@ Privacy grants are keyed on bundle id + team, so they survive every rebuild.
   it back), so `pkill -x RemoteTV` first and `open -g -a /Applications/RemoteTV.app` after.
   TVCTL_FAKE_IDENTITY=1 makes a direct session use an identity the TV never paired (tests
   the "pairing lost" path).
-- The app answers `remotetv://` URLs (`open -g "remotetv://…"`): `show`, `hide`,
-  `press/<button>/…`, `skip/<s>`, `sleep`, `wake`, `pairing`, and the debug
-  `snapshot?path=/abs/file.png[&controls=1][&appearance=dark|light|system]` (window content
-  to PNG; Liquid Glass doesn't render offscreen, layout and symbols do).
+- `tvctl snapshot <file.png> [dark|light] [controls]` writes the window (with the sidebar)
+  to a PNG; Liquid Glass doesn't render offscreen, layout and symbols do.
+- `remotetv://` URLs only do `show`, `hide`, `sidebar`: any web page or app can open a URL,
+  so nothing that touches the TV or the disk may ever be added to the scheme.
 - Logs: `/usr/bin/log show --last 5m --predicate 'subsystem == "com.lingrino.remotetv"' --info --debug`
   (plain `log` is a shell builtin here). Launch milestones: `launch→window`,
   `launch→connected`, `reopen→shown`.
@@ -102,7 +105,7 @@ Privacy grants are keyed on bundle id + team, so they survive every rebuild.
 ## Architecture
 
 ```
-Sources/RemoteCore/       protocol stack, no AppKit, unit-tested
+Sources/RemoteCore/       protocol stack, no AppKit, unit-tested (release builds keep bounds checks)
   OPACK.swift             Apple's binary serialization: Writer (allocation-light), decoder
   TLV8.swift              HAP pairing TLVs (fragments >255 bytes)
   BigUInt.swift           minimal bignum + Montgomery modpow (SRP only)
@@ -115,13 +118,21 @@ Sources/RemoteCore/       protocol stack, no AppKit, unit-tested
   SRP.swift               SRP-6a client, 3072-bit group, SHA-512
   HAP.swift               PairSetup (M1–M6), PairVerify (M1–M4), Credentials, crypto helpers
   Connection.swift        NWConnection, framing, FrameCipher (ChaCha20-Poly1305)
-  Remote.swift            session state machine, handshake, commands, events
+  Remote.swift            session state machine: connect, pair-verify, pairing, handshake, events
+  Remote+Commands.swift   buttons, playback, text, power, apps, touch, raw requests (Waiter)
+  Remote+Reliability.swift deaf watchdog, probe, reconnect, goodbye, wake knock
+  Remote+Media.swift      the AirPlay/MRP tunnel's lifecycle and the now-playing merge
+  UnixSocket.swift        sockaddr_un helper (control socket; app and tvctl)
   Discovery.swift         Device, Browser (_companion-link._tcp, AppleTV* only)
   CredentialStore.swift   ~/Library/Application Support/RemoteTV/pairings.tsv (0600)
   Errors.swift            ProtocolError (one user-facing line each)
 Sources/RemoteTV/         the app (AppKit)
   main.swift              delegate first (starts connecting), then NSApplication
-  AppDelegate.swift       wiring: window, remote lifecycle/retry, pairing, keys, URLs, Launch timing
+  AppDelegate.swift       lifecycle, window, show/hide/idle, remote lifecycle/retry, header, URLs, Launch timing
+  AppDelegate+Pairing.swift   TV menu, browsing, pairing flow
+  AppDelegate+Sidebar.swift   opening the sidebar (window widening), loading its data
+  AppDelegate+Keyboard.swift  keys and media keys → buttons; releasing held keys
+  AppDelegate+Rename.swift    following a renamed TV
   RemoteView.swift        fixed layout (flipped): NowPlayingStrip (title + scrubber), TextEntry, PairingView
   ClickPad.swift          glass clickpad: wedges/center hit testing, trackpad swipe → touch
   Controls.swift          Theme, PressView (down/up), GlassButton, SplitPill, IconButton
@@ -130,18 +141,22 @@ Sources/RemoteTV/         the app (AppKit)
   ControlServer.swift     tvctl's Unix socket
   Commands.swift          tvctl commands on the app's session; installs the tvctl symlink
 Sources/TVCtl/            tvctl
-Tests/RemoteCoreTests/    codecs, bignum/SRP vectors (from Python), fake HAP accessory
+Tests/RemoteCoreTests/    codecs, bignum/SRP vectors (from Python), fake HAP accessory,
+                          FakeTV (loopback Apple TV: framing, pair-verify, encryption) +
+                          SessionTests (Remote's state machine, liveness, trust boundary)
 ```
 
-Threading: everything (Remote, Connection, NW callbacks) runs on the main thread/queue.
-A key press goes event → OPACK → encrypt → `NWConnection.send` synchronously; no hops.
-Only SRP (pairing, ~10 ms release / ~1 s debug) runs on a detached task.
+Threading: Remote, Connection, the AirPlay tunnel and all NW callbacks run on the main
+thread/queue. A key press goes event → OPACK → encrypt → `NWConnection.send` synchronously;
+no hops. Off the main thread: SRP (pairing, ~10 ms release / ~1 s debug, detached task),
+the control socket's threads (they only hand requests to main), sidebar image decoding
+(ImageIO thumbnails on a concurrent queue), URLSession, and NWPathMonitor's queue.
 
 ## Protocol notes (Companion Link; owner's TV: AppleTV18,1, tvOS 27.2.1)
 
 Status (2026-11-20): pairing, pair-verify (~37 ms connect), buttons, skip, seek, now
-playing and ToggleCaptions verified live. Text input implemented per protocol and
-unit-tested, not yet seen working live (see below).
+playing, text input (owner-tested in Search and YouTube), mute, artwork, app list and Up
+Next verified live; ToggleCaptions is accepted but flaky (as on Apple's own remote).
 
 **Ground truth for message names**: macOS ships the iOS remote's framework,
 `TVRemoteCore` (and Rapport, the Companion client), in the dyld shared cache. `strings -a`
@@ -162,7 +177,11 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
   M1 = method 0, state 1 → TV shows a 4-digit PIN. SRP user "Pair-Setup", password = PIN.
   M5 carries our id, Ed25519 LTPK, signature and a name TLV (0x11, OPACK {name}).
 - Messages: OPACK `{_i: name, _t: 1 event | 2 request | 3 response, _c: content, _x: xid}`;
-  `_em` in a response = error.
+  `_em` in a response = error. OPACK sized integers are **signed** (the TV sends -6714 as
+  0x31 C6 E5): the writer picks signed widths (200 → 2 bytes), the reader sign-extends.
+- Trust boundary: until pair-verify finishes and frames are encrypted, nothing from the
+  socket but pairing replies is processed (OPACK message frames are dropped), so a LAN host
+  answering for the TV's Bonjour name can't inject events.
 - Handshake (sent back to back, no waiting): `_systemInfo` (a stable `_i` makes the TV push
   power events), `_touchStart`, `_sessionStart {_srvT: com.apple.tvremoteservices, _sid}`,
   `TVRCSessionStart {ProtocolVersionKey: "1.2"}` (needed before `FetchAttentionState`),
@@ -186,11 +205,11 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
   and `$top.documentState.docSt.contextBeforeInput` if a field is focused), events
   `_tiStarted {_tiD}` / `_tiStopped`, edit = event `_tiC {_tiV: 1, _tiD:
   RTITextOperations archive ($archiver RTIKeyedArchiver; targetSessionUUID NSUUID,
-  keyboardOutput TIKeyboardOutput{insertionText}, textToAssert)}`. The app replaces the
-  whole text (`textToAssert`) on every edit. The TV only pushes events to clients whose
-  `_systemInfo._i` is non-null (pyatv 0.17 broke focus events by dropping it). Opening
-  Search with `_launchApp com.apple.TVSearch` did NOT produce a session blind (focus
-  state unknown without seeing the TV): first thing to verify with the owner.
+  keyboardOutput TIKeyboardOutput{insertionText, deletionCount}, textToAssert)}`. The app
+  sends each local change as delete-N + insert at the TV's cursor (`RTI.diff`): YouTube
+  doesn't report its field's text, so replacing it would wipe what's there. The TV only pushes events to clients whose
+  `_systemInfo._i` is non-null (pyatv 0.17 broke focus events by dropping it). Launching
+  Search remotely doesn't by itself focus a field (no session); the owner's own use works.
 - AirPlay remote-control tunnel (`AirPlay.swift`, verified 2026-11-20, ready in ~55–70 ms):
   Bonjour `_airplay._tcp` (same instance name as the Companion service), IPv4.
   `POST /pair-verify` HTTP/1.1 (headers User-Agent AirPlay/320.20, X-Apple-HKP 3,
@@ -223,7 +242,7 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
   9}}); mute = SendHIDEvent (8/13) consumer page 12,
   usage 0xE2, down+up, then an empty GENERIC (42) flush.
   **Subtitles: never send EnableLanguageOption (53) / DisableLanguageOption (54)** with
-  options.languageOption 27 = a LanguageOption from the item: tried 2026-11-21 in the TV
+  options.languageOption 27 = a LanguageOption from the item: tried 2026-11-20 in the TV
   app, the show's audio went silent until the owner re-picked an audio track (the command
   apparently replaces the whole media selection). The button sends Companion
   `ToggleCaptions` (what Apple's remote does; flaky on Apple's remote too). MRP language
@@ -257,14 +276,25 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
 - Data-stream bug to not repeat: the frame type is at bytes 4–11 (after the size); a sync
   frame that isn't answered with a "rply" makes the TV stop sending.
 
-## Reliability (2026-11-21; keep all of these)
+## Reliability (2026-11-20; keep all of these)
 
 - **Deaf sessions**: a TV can keep TCP up while its remote service stops answering (seen by
   other clients after hours). `_hidC` presses and probes are tracked by xid; one unanswered
   for 3 s drops the session, discards queued presses (never replay late) and the app
   reconnects (0.3 s). `Remote.checkDeaf`.
 - **Probe on show**: when the window comes forward after ≥15 s of quiet, a cheap answered
-  request (`FetchMediaControlStatus`) finds a dead session before the user presses.
+  request (`FetchMediaControlStatus`) finds a dead session before the user presses. A
+  network change forces the same probe (instead of a reconnect).
+- **Every request completes**: `raw` requests (apps, Up Next, tvctl raw) get their reply,
+  (nil, error), "disconnected" when the connection ends, or "timed out" after 5 s
+  (`Remote.Waiter`) — never a hang (the sidebar once sat on "Loading…" forever).
+- **Queued presses expire**: commands made while connecting run only if ≤2 s old when the
+  session comes up; a press is one queue entry (never half a press) and a button's "up" is
+  never dropped (no stuck holds).
+- **Unreadable messages**: a session message that doesn't decode is logged and dropped,
+  not fatal; every frame is decrypted even if its type is unknown (the nonce counter).
+- **MRP**: the handshake must finish within 5 s or the tunnel is torn down and retried;
+  merged content items are compacted (never truncated), artwork stored apart.
 - **Keepalive**: Companion NoOp frame (type 1, empty) every 30 s; TCP keepalive (10 s idle,
   2×5 s) catches dead peers; AirPlay `POST /feedback` every 2 s and a 6 s
   unanswered-request watchdog on the AirPlay control channel restarts the tunnel.
@@ -275,12 +305,16 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
   (don't wait ~20 s for keepalive). Wake from sleep → fresh connection.
 - **Wake knock**: the TV's last address (UserDefaults `host.<name>`) gets brief TCP
   connects on 49153/7000/3689/49152/32498 when it can't be reached (a sleeping Apple TV's
-  Bonjour sleep proxy wakes it); at most every 10 s.
-- **Pairing lost** (TV reset / removed under Remotes and Devices): pair-verify M2/M4 comes
-  back with an error TLV → `.unpaired`: no retry loop, the menu offers Pair Again.
-- **Renamed TV**: pairings are keyed by name; when the name can't be found and an unpaired
-  Apple TV is on the network, the stored credentials are tried on it (only the right TV can
-  complete pair-verify) and the pairing moves over (`AppDelegate.followRename`).
+  Bonjour sleep proxy wakes it); at most every 10 s and only for the first 3 failures (away
+  from home the address belongs to someone else's network).
+- **Pairing lost** (TV reset / removed under Remotes and Devices): pair-verify comes back
+  with error 2 → `.unpaired`: no retry loop, the menu offers Pair Again. Other codes (busy,
+  back off) are ordinary retryable failures. Pairing attempts are tokened (a stale SRP
+  result is dropped) and M3/M5 have a 10 s timeout.
+- **Renamed TV**: pairings are keyed by name; when the name can't be found (`.notFound`,
+  `.timeout`) and an unpaired Apple TV is on the network, the stored credentials are tried
+  on it — each candidate once per outage (only the right TV can complete pair-verify) — and
+  the pairing moves over (`AppDelegate.followRename`).
 - **Local Network denied**: detected (`NWPath.unsatisfiedReason == .localNetworkDenied`,
   DNS -65570) → "Local Network access is off. Click to allow it." (opens the Privacy pane);
   retries continue so it connects once allowed.
@@ -290,11 +324,31 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
   The TV acknowledges every press either way, so dimming is the only honest feedback.
 - **Input**: one-shot buttons (power, subtitles, mute) fire only if released over them;
   held buttons always send the "up". Key repeats are ignored (the TV repeats a held
-  direction itself); held keys/clicks are released when the window loses focus. IME
+  direction itself); held keys/clicks are released when the window loses focus, when focus
+  moves into the text bar, and when ⌘ goes down (AppKit sends no key-up for a key released
+  while ⌘ is held). Media keys pass through to the Mac when the TV isn't connected.
+- **Hidden** (closed, ⌘H, `tvctl hide`): ticker, artwork and Bonjour browsing stop; the
+  session ends after 10 min (re-armed by tvctl commands, which reconnect on demand).
+- Failures are typed (`Status.failed(ProtocolError)`): behavior never depends on the
+  wording of an error message.
+
+## Security (2026-11-20 review)
+
+- Untrusted input: everything from the network is parsed with explicit bounds; integers
+  from binary plists are range-checked (`Reader.int`), plist decoding has an object budget
+  (shared references could expand exponentially), OPACK/TLV8/protobuf/HTTP parsers throw
+  on truncation. RemoteCore is built without `-Ounchecked`, so a missed check traps.
+- TV identity: pair-verify checks the TV's Ed25519 signature against the paired key
+  before anything else; pairing requires a valid key from the TV (signature verified when
+  sent). Nothing derived from our private seed is sent (`pubID` hashes the public key).
+- Control socket: 0600 (created under umask 0177), directory 0700, and `getpeereid` must
+  match our uid; the reply handoff is locked. URL scheme: window actions only.
+- Pairings file: written to a fresh 0600 file (O_EXCL), fsynced, renamed; a file that
+  exists but can't be read is never overwritten; unknown lines are preserved. IME
   composition isn't sent until committed. Long trackpad swipes lift and re-grip at the
   virtual pad's edge (never a lift without motion, which would be a tap).
 
-### Other projects' bugs, checked (2026-11-21)
+### Other projects' bugs, checked (2026-11-20)
 
 Itsytv (66 issues), atv-desktop-remote, Clicker, alokdhir/appletv-remote, ribren/clicker,
 Raycast, Homebridge, Home Assistant. Handled: stale pairing loops; Keychain prompts (file
@@ -326,8 +380,9 @@ before arrows.
 
 ## Open work / ideas (owner hasn't asked for these; propose before big ones)
 
-- Not yet seen live: playing an Up Next item (the TV's Up Next service returned
-  AMSErrorDomain 301 during the session that built it) and launching from the app grid
-  (same `_launchApp` as tvctl, which works).
+- Not yet seen live: playing an Up Next item and launching from the app grid (the same
+  `_launchApp` tvctl uses, which works).
+- Review leftovers judged not worth it now: unifying `Connection`/`HAPStream` and their
+  ciphers (different framing and nonce layouts; ~100 similar lines), a menu-bar mode.
 - Hold a skip button to fast-forward/rewind (`_mcc` 8–11 begin/end).
 - Reduce Loud Sounds toggle (one TVRC request); a sleep timer (sleep the TV in N minutes).

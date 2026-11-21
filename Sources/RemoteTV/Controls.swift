@@ -6,7 +6,6 @@ enum Theme {
     static let padDiameter: CGFloat = 232
     static let buttonDiameter: CGFloat = 62
     static let symbolSize: CGFloat = 20
-    static let gap: CGFloat = 22
 }
 
 /// Shared down/up plumbing for remote controls: a press is "down" on mouse-down and "up"
@@ -83,8 +82,9 @@ final class GlassButton: PressView {
     }
 }
 
-/// The volume capsule: − | mute | +, three hit zones in one glass pill. The middle
-/// shows the speaker (slashed when muted) and is dimmed when mute isn't available.
+/// The volume capsule: − | mute | +, three hit zones in one glass pill. The middle is
+/// the speaker (mute toggle; HDMI-CEC audio doesn't report mute state, so it doesn't show
+/// one), dimmed when mute isn't available.
 final class VolumePill: NSView {
     enum Part { case down, mute, up }
     var onPress: ((Part, _ down: Bool) -> Void)?
@@ -92,7 +92,6 @@ final class VolumePill: NSView {
     private let speaker = NSImageView()
     private var active: Part?
 
-    var muted = false { didSet { if muted != oldValue { updateSpeaker() } } }
     var muteAvailable = false { didSet { if muteAvailable != oldValue { updateSpeaker() } } }
 
     init(width: CGFloat, height: CGFloat) {
@@ -118,10 +117,9 @@ final class VolumePill: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     private func updateSpeaker() {
-        speaker.image = NSImage(systemSymbolName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill",
-                                accessibilityDescription: muted ? "Unmute" : "Mute")?
+        speaker.image = NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: "Mute")?
             .withSymbolConfiguration(.init(pointSize: Theme.symbolSize - 3, weight: .regular))
-        speaker.contentTintColor = muted ? .controlAccentColor : (muteAvailable ? .secondaryLabelColor : .quaternaryLabelColor)
+        speaker.contentTintColor = muteAvailable ? .secondaryLabelColor : .quaternaryLabelColor
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }

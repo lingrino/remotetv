@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import RemoteCore
 
 /// The sidebar: a Liquid Glass panel that slides out of the remote's right edge (⌃⌘S or
@@ -160,17 +161,26 @@ final class NowPlayingCard: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// What the art box shows (artwork of an item, or an app's icon), so updates for the
+    /// same picture (every position update) don't decode it again.
+    private var shown: String?
+
     func show(_ np: NowPlaying?, app: TVApp?) {
         guard let np else { return }
         let w = bounds.width
         let artW: CGFloat = 132
         art.frame = NSRect(x: 0, y: 0, width: artW, height: NowPlayingCard.height)
-        if let a = np.artwork, let img = NSImage(data: Data(a)) {
-            art.set(img, fill: true)
-        } else if let i = app?.icon, let img = NSImage(data: Data(i)) {
-            art.set(img, fill: false)
-        } else {
-            art.set(nil, fill: false)
+        let key: String? = if let a = np.artwork { "art \(np.itemID ?? "") \(a.count)" }
+            else if let i = app?.icon { "icon \(app?.bundleID ?? "") \(i.count)" } else { nil }
+        if key != shown {
+            shown = key
+            if let a = np.artwork {
+                Images.decode(a, maxPixel: 400) { [weak self] img in if self?.shown == key { self?.art.set(img, fill: true) } }
+            } else if let i = app?.icon {
+                Images.decode(i, maxPixel: 400) { [weak self] img in if self?.shown == key { self?.art.set(img, fill: false) } }
+            } else {
+                art.set(nil, fill: false)
+            }
         }
         let x = artW + 12, tw = w - x
         title.stringValue = np.title ?? "Playing"
@@ -242,7 +252,7 @@ final class UpNextRow: HoverView {
         progress.cornerRadius = 1
         thumb.layer?.addSublayer(progress)
         if let url = item.imageURL(width: 320, height: 180) {
-            Images.shared.load(url) { [weak self] img in self?.thumb.set(img, fill: true) }
+            Images.shared.load(url, maxPixel: 320) { [weak self] img in self?.thumb.set(img, fill: true) }
         }
         setAccessibilityRole(.button)
         setAccessibilityLabel("Play \(item.title)")
@@ -323,7 +333,9 @@ final class AppTile: HoverView {
         super.init(frame: .zero)
         icon.cornerRadius = 8
         addSubview(icon)
-        if let d = app.icon, let img = NSImage(data: Data(d)) { icon.set(img, fill: true) }
+        if let d = app.icon {
+            Images.decode(d, maxPixel: 240) { [weak self] img in self?.icon.set(img, fill: true) }
+        }
         name.stringValue = app.name
         name.font = .systemFont(ofSize: 10.5)
         name.textColor = .secondaryLabelColor
@@ -409,33 +421,54 @@ final class ImageBox: NSView {
             ? nil : NSColor.quaternaryLabelColor.withAlphaComponent(0.25).cgColor
     }
 
-    func set(_ image: NSImage?, fill: Bool) {
+    func set(_ image: CGImage?, fill: Bool) {
         hasImage = image != nil
         layer?.contentsGravity = fill ? .resizeAspectFill : .resizeAspect
         layer?.contentsScale = window?.backingScaleFactor ?? 2
-        layer?.contents = image?.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        layer?.contents = image
         needsDisplay = true
     }
 }
 
-/// Up Next thumbnails from Apple's image CDN, kept in memory for the app's lifetime
-/// (a few dozen small JPEGs).
+/// Image decoding for the sidebar: off the main thread, downsampled to what's displayed
+/// (ImageIO thumbnails: a 600 px JPEG or a tvOS icon becomes a small bitmap, not a
+/// full-size one). Up Next thumbnails come from Apple's image CDN and stay cached for the
+/// run (bounded).
 @MainActor
 final class Images {
     static let shared = Images()
-    private var cache: [URL: NSImage] = [:]
-    private var waiting: [URL: [(NSImage) -> Void]] = [:]
+    private var cache: [URL: CGImage] = [:]
+    private var waiting: [URL: [(CGImage) -> Void]] = [:]
+    private static let queue = DispatchQueue(label: "images", qos: .userInitiated, attributes: .concurrent)
 
-    func load(_ url: URL, _ done: @escaping (NSImage) -> Void) {
+    nonisolated static func thumbnail(_ data: Data, maxPixel: Int) -> CGImage? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let opts: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                     kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                                     kCGImageSourceCreateThumbnailWithTransform: true,
+                                     kCGImageSourceShouldCacheImmediately: true]
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+    }
+
+    static func decode(_ bytes: [UInt8], maxPixel: Int, _ done: @escaping @MainActor (CGImage?) -> Void) {
+        let data = Data(bytes)
+        queue.async {
+            let img = thumbnail(data, maxPixel: maxPixel)
+            DispatchQueue.main.async { MainActor.assumeIsolated { done(img) } }
+        }
+    }
+
+    func load(_ url: URL, maxPixel: Int, _ done: @escaping (CGImage) -> Void) {
         if let img = cache[url] { return done(img) }
         if waiting[url] != nil { waiting[url]?.append(done); return }
         waiting[url] = [done]
         URLSession.shared.dataTask(with: url) { data, _, _ in
-            let img = data.flatMap { NSImage(data: $0) }
+            let img = data.flatMap { Images.thumbnail($0, maxPixel: maxPixel) }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     let callbacks = self.waiting.removeValue(forKey: url) ?? []
                     guard let img else { return }
+                    if self.cache.count >= 120 { self.cache.removeAll() }   // Up Next is ~25 items
                     self.cache[url] = img
                     for c in callbacks { c(img) }
                 }

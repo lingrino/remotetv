@@ -130,6 +130,20 @@ final class RemoteView: NSView {
     override func keyUp(with event: NSEvent) {
         if onKey?(event, false) != true { super.keyUp(with: event) }
     }
+
+    var onResign: (() -> Void)?
+    var onFlags: ((NSEvent) -> Void)?
+
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        if ok { onResign?() }
+        return ok
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        onFlags?(event)
+        super.flagsChanged(with: event)
+    }
 }
 
 /// Title and a scrubber for what's playing; status text ("Connecting…", "Not Playing")
@@ -230,7 +244,7 @@ final class NowPlayingStrip: NSView {
 
     /// 0:07 · 12:34 · 1:02:03
     static func clock(_ seconds: Double) -> String {
-        let t = Int(seconds.rounded(.down))
+        let t = seconds.isFinite ? Int(min(1e7, max(0, seconds)).rounded(.down)) : 0
         let h = t / 3600, m = t / 60 % 60, s = t % 60
         let ss = s < 10 ? "0\(s)" : "\(s)"
         if h > 0 { return "\(h):\(m < 10 ? "0\(m)" : "\(m)"):\(ss)" }

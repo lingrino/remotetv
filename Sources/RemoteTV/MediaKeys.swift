@@ -58,8 +58,6 @@ final class MediaKeys {
         if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
     }
 
-    var isEnabled: Bool { tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false }
-
     // MARK: - Tap
 
     private nonisolated static let systemDefined: CGEventMask = 14   // NX_SYSDEFINED

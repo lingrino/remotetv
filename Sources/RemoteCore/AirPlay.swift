@@ -76,6 +76,8 @@ final class HAPStream {
     var onData: (([UInt8]) -> Void)?
     var onClosed: ((ProtocolError?) -> Void)?
 
+    isolated deinit { nw.cancel() }
+
     init(endpoint: NWEndpoint) {
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
@@ -253,7 +255,9 @@ public final class AirPlayTunnel {
     private let sessionID = UInt32.random(in: 1...UInt32.max)
     private let dacpID = String(UInt64.random(in: 1...UInt64.max), radix: 16, uppercase: true)
     private let activeRemote = UInt32.random(in: 1...UInt32.max)
-    private var sendSeqno = UInt64.random(in: 0x1_0000_0000..<0x1_FFFF_FFFF)
+    /// Our sync frames all carry one sequence number (as other clients do; the TV answers
+    /// each with a "rply" regardless).
+    private let sendSeqno = UInt64.random(in: 0x1_0000_0000..<0x1_FFFF_FFFF)
     private var feedback: Timer?
     private var timeout: DispatchWorkItem?
 
@@ -311,7 +315,7 @@ public final class AirPlayTunnel {
         waitingSince.removeAll()
     }
 
-    private func fail(_ e: ProtocolError) {
+    func fail(_ e: ProtocolError) {
         AirPlayTunnel.log.error("\(e.description, privacy: .public)")
         teardown()
         state = .failed(e.description)
@@ -508,7 +512,7 @@ public final class AirPlayTunnel {
             for i in 20..<28 { seqno = seqno << 8 | UInt64(dataBuffer[i]) }
             let payload = Array(dataBuffer[32..<size])
             dataBuffer.removeFirst(size)
-            onTrace?("← data frame \(String(decoding: dataBuffer.isEmpty ? [] : [], as: UTF8.self))\(isSync ? "sync" : "other") \(size) B")
+            onTrace?("← data frame \(isSync ? "sync" : "other") \(size) B")
             if isSync { data?.send(AirPlayTunnel.frame(type: "rply", command: nil, seqno: seqno, payload: [])) }
             if !payload.isEmpty, onTrace != nil { onTrace?("  payload \((try? Plist.decode(payload)).map { "\($0)" }?.prefix(300) ?? "not a plist")") }
             guard !payload.isEmpty, let p = try? Plist.decode(payload), let blob = p["params"]?["data"]?.data else { continue }

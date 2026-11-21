@@ -84,11 +84,24 @@ public final class MediaRemote {
 
     private var handshakeID = ""
 
+    private var handshakeTimeout: DispatchWorkItem?
+
     private func tunnelState(_ s: AirPlayTunnel.State) {
         onTunnel?(s)
         switch s {
         case .ready:
             handshakeID = UUID().uuidString
+            // A TV that never answers DEVICE_INFO would leave a "ready" tunnel doing
+            // nothing; give it 5 s, then tear down so the owner's retry kicks in.
+            handshakeTimeout?.cancel()
+            let t = DispatchWorkItem { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, !self.isReady else { return }
+                    self.tunnel.fail(.connection("MRP handshake timed out"))
+                }
+            }
+            handshakeTimeout = t
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: t)
             // DEVICE_INFORMATION must come first; the rest follows its reply.
             tunnel.send(MediaRemote.message(type: MessageType.deviceInfo, identifier: handshakeID, ext: Ext.deviceInfo) { w in
                 w.string(1, self.clientID)            // uniqueIdentifier
@@ -117,6 +130,7 @@ public final class MediaRemote {
     }
 
     private func handshakeReply() {
+        handshakeTimeout?.cancel()
         tunnel.send(MediaRemote.message(type: MessageType.setConnectionState, ext: Ext.setConnectionState) { w in
             w.int(1, 2)   // Connected
         })
@@ -278,7 +292,8 @@ public final class MediaRemote {
                     }
                 }
                 p.location = q.int(1) ?? 0
-                p.items = q.messages(2).map { ($0.string(1), $0.fields.isEmpty ? [] : MediaRemote.reencode($0)) }
+                // Artwork (field 3) lives in `artwork`, never in the stored item.
+                p.items = q.messages(2).map { ($0.string(1), MediaRemote.reencode($0, without: 3)) }
             }
             clients[client, default: Client()].players[player] = p
             if activeClient == nil { activeClient = client }
@@ -289,9 +304,11 @@ public final class MediaRemote {
             guard var p = clients[client]?.players[player] else { return }
             for item in u.messages(1) {
                 guard let id = item.string(1), let i = p.items.firstIndex(where: { $0.id == id }) else { continue }
-                // Protobuf merge = concatenation: later fields win.
-                var merged = p.items[i].item + MediaRemote.reencode(item)
-                if merged.count > 1 << 16 { merged = MediaRemote.reencode(item) }
+                // Protobuf merge = concatenation: later fields win. Compacted when it grows
+                // (a long session sends many deltas), never truncated: a delta alone may
+                // carry only the elapsed time.
+                var merged = p.items[i].item + MediaRemote.reencode(item, without: 3)
+                if merged.count > 8 << 10 { merged = MediaRemote.compact(merged) }
                 p.items[i].item = merged
             }
             clients[client]?.players[player] = p
@@ -322,15 +339,47 @@ public final class MediaRemote {
     }
 
     /// The serialized form of a decoded message (its fields, in order).
-    private static func reencode(_ m: ProtoMessage) -> [UInt8] {
+    private static func reencode(_ m: ProtoMessage, without skip: Int? = nil) -> [UInt8] {
         var w = ProtoWriter()
-        for (f, v) in m.fields {
+        for (f, v) in m.fields where f != skip {
             switch v {
             case .varint(let x): w.varint(f, x)
             case .fixed64(let x): w.double(f, Double(bitPattern: x))
             case .fixed32(let x): w.float(f, Float(bitPattern: x))
             case .bytes(let b): w.data(f, Array(b))
             }
+        }
+        return w.bytes
+    }
+
+    /// A merged ContentItem rewritten with one value per metadata field (the last) and the
+    /// latest language options: the same item, without the history of deltas.
+    static func compact(_ item: [UInt8]) -> [UInt8] {
+        guard let m = try? ProtoMessage(item) else { return item }
+        var w = ProtoWriter()
+        if let id = m.string(1) { w.string(1, id) }
+        if let md = m.message(2) {
+            var last: [Int: ProtoMessage.Value] = [:]
+            var order: [Int] = []
+            for (f, v) in md.fields {
+                if last[f] == nil { order.append(f) }
+                last[f] = v
+            }
+            var mw = ProtoWriter()
+            for f in order {
+                switch last[f]! {
+                case .varint(let x): mw.varint(f, x)
+                case .fixed64(let x): mw.double(f, Double(bitPattern: x))
+                case .fixed32(let x): mw.float(f, Float(bitPattern: x))
+                case .bytes(let b): mw.data(f, Array(b))
+                }
+            }
+            w.data(2, mw.bytes)
+        }
+        for f in [5, 6] {   // language options: the last group sent replaces earlier ones
+            let groups = m.datas(f)
+            let distinct = groups.reduce(into: [[UInt8]]()) { if !$0.contains($1) { $0.append($1) } }
+            for g in distinct { w.data(f, g) }
         }
         return w.bytes
     }
@@ -358,13 +407,13 @@ public final class MediaRemote {
         guard p.location < p.items.count, let item = try? ProtoMessage(p.items[p.location].item),
               let md = item.message(2) else { return nil }
         let title = md.string(1)
-        let duration = md.double(14).flatMap { $0 > 0 && $0.isFinite ? $0 : nil }
+        let duration = NowPlaying.seconds(md.double(14)).flatMap { $0 > 0 ? $0 : nil }
         guard title != nil || duration != nil else { return nil }
         let playing = p.state == 1
-        let rate = md.float(39).map(Double.init) ?? (playing ? 1 : 0)
+        let rate = NowPlaying.rate(md.float(39).map(Double.init)) ?? (playing ? 1 : 0)
         var np = NowPlaying(title: title, duration: md.bool(37) == true ? nil : duration,
-                            elapsed: md.double(35) ?? 0,
-                            timestamp: md.double(74) ?? Date().timeIntervalSinceReferenceDate,
+                            elapsed: NowPlaying.seconds(md.double(35)) ?? 0,
+                            timestamp: NowPlaying.timestamp(md.double(74)) ?? Date().timeIntervalSinceReferenceDate,
                             rate: playing ? rate : 0, state: p.state)
         np.subtitle = md.string(63).flatMap { $0 == title ? nil : $0 } ?? md.string(2)
         np.bundleID = nil

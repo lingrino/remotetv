@@ -7,10 +7,10 @@
 #
 # Signing identity, REMOTETV_SIGN_IDENTITY:
 #   unset  the Developer ID from the signing keychain (setup-signing.sh, shared with the
-#          user's other apps), no timestamp. Privacy grants (Local Network, Accessibility)
+#          owner's other apps), no timestamp. Privacy grants (Local Network, Accessibility)
 #          are keyed on the designated requirement (bundle id + team), so they survive
-#          rebuilds.
-#   "-"    ad-hoc (CI-style build checks; grants would not stick)
+#          rebuilds. Without that keychain (anyone else's Mac): ad-hoc, with a notice.
+#   "-"    ad-hoc (privacy grants are asked again after each rebuild)
 #   other  that identity from the keychain search list, with a secure timestamp
 set -euo pipefail
 
@@ -46,7 +46,12 @@ sign=(codesign --force --options runtime --entitlements "$ROOT/Resources/RemoteT
       --identifier com.lingrino.remotetv)
 # Nested code is signed first (same identity), then the app seals it.
 helper=(codesign --force --options runtime --identifier com.lingrino.remotetv.tvctl)
-case "${REMOTETV_SIGN_IDENTITY:-}" in
+IDENTITY="${REMOTETV_SIGN_IDENTITY:-}"
+if [[ -z "$IDENTITY" && ! -f "$PASS_FILE" ]]; then
+  echo "note: no Developer ID signing set up (scripts/setup-signing.sh); signing ad-hoc" >&2
+  IDENTITY="-"
+fi
+case "$IDENTITY" in
   "")
     security unlock-keychain -p "$(cat "$PASS_FILE")" "$KC"
     id="$(security find-identity -v -p codesigning "$KC" | awk '/"Developer ID Application: / { print $2; exit }')"

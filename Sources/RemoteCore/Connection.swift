@@ -75,6 +75,10 @@ final class Connection {
     private var closed = false
     var onEvent: ((Event) -> Void)?
 
+    // A dropped Connection must not leave its socket open (Network.framework doesn't cancel
+    // on deinit): e.g. a pairing attempt replaced mid-PIN would keep the PIN on the TV.
+    isolated deinit { nw.cancel() }
+
     init(endpoint: NWEndpoint) {
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true                 // a button press is two tiny frames: never wait for Nagle
@@ -155,6 +159,7 @@ final class Connection {
             // owner decides when to try again.
             if nw.currentPath?.unsatisfiedReason == .localNetworkDenied { return finish(.localNetworkDenied) }
             if case .dns(let code) = err, code == -65570 { return finish(.localNetworkDenied) }   // kDNSServiceErr_PolicyDenied
+            if case .dns = err { return finish(.notFound) }
             finish(.connection(Connection.describe(err)))
         case .cancelled:
             finish(nil)
@@ -191,7 +196,8 @@ final class Connection {
             let body = buffer[(i + 4)..<(i + 4 + length)]
             let raw = buffer[i]
             i += 4 + length
-            guard let type = FrameType(rawValue: raw) else { continue }
+            // Decrypt every frame, even of a type we don't handle: the receive nonce is a
+            // counter, so skipping one would make every later frame fail.
             var payload: [UInt8]
             if cipher != nil && !body.isEmpty {
                 do {
@@ -203,6 +209,7 @@ final class Connection {
             } else {
                 payload = Array(body)
             }
+            guard let type = FrameType(rawValue: raw) else { continue }
             onEvent?(.frame(type, payload))
             if closed { return }
         }
@@ -221,8 +228,6 @@ final class Connection {
         case .posix(let code) where code == .ETIMEDOUT: "the Apple TV didn't answer"
         case .posix(let code) where code == .ENETDOWN || code == .ENETUNREACH || code == .EHOSTUNREACH:
             "the Apple TV isn't reachable"
-        case .dns(let code) where code == -65570:   // kDNSServiceErr_PolicyDenied
-            "Local Network access is off for RemoteTV (System Settings → Privacy & Security)"
         case .dns: "couldn't find the Apple TV on the network"
         default: e.localizedDescription
         }

@@ -43,15 +43,15 @@ public struct UpNextItem: Sendable, Equatable, Identifiable {
         var sub: String?
         if let show = a.field(mi, "showTitle")?.string, show != title { sub = show }
         // Season/episode come as integers or reals depending on the item.
-        let season = a.field(mi, "seasonNumber")?.double.map(Int.init)
-        let episode = a.field(mi, "episodeNumber")?.double.map(Int.init)
+        let season = a.field(mi, "seasonNumber")?.double.flatMap { Int(exactly: $0.rounded()) }
+        let episode = a.field(mi, "episodeNumber")?.double.flatMap { Int(exactly: $0.rounded()) }
         if let e = episode {
             sub = [sub, season.map { "S\($0) · E\(e)" } ?? "E\(e)"].compactMap { $0 }.joined(separator: " · ")
         }
         subtitle = sub
         service = a.field(root, "service")?.string
         reason = a.field(root, "reason")?.string
-        progress = a.field(root, "progress")?.double
+        progress = a.field(root, "progress")?.double.flatMap { $0.isFinite ? min(1, max(0, $0)) : nil }
         actionURL = a.field(a.field(root, "actionURL"), "NS.relative")?.string
         imageTemplate = a.field(mi, "imageURLTemplate")?.string
     }
@@ -71,20 +71,25 @@ extension Remote {
             }
             return
         }
-        // Page 0 tells the count; then the rest, one app per request, all in flight.
+        // Page 0 tells the count; then the rest, one app per request, at most 4 in flight
+        // (each carries a PNG: a press must never wait behind a burst of icons).
         page(0) { [weak self] first, count in
             guard let self else { return }
             guard count > 1 else { return completion(first) }
             var pages = [[TVApp]?](repeating: nil, count: count)
             pages[0] = first
-            var left = count - 1
-            for i in 1..<count {
+            var next = 1, left = count - 1
+            @MainActor func more() {
+                guard next < count else { return }
+                let i = next
+                next += 1
                 self.page(i) { apps, _ in
                     pages[i] = apps
                     left -= 1
-                    if left == 0 { completion(pages.flatMap { $0 ?? [] }) }
+                    if left == 0 { completion(pages.flatMap { $0 ?? [] }) } else { more() }
                 }
             }
+            for _ in 0..<min(4, count - 1) { more() }
         }
     }
 
@@ -97,7 +102,7 @@ extension Remote {
                     apps.append(TVApp(bundleID: k, name: v["LocalizedAppName"]?.string ?? k, icon: v["ImageKey"]?.data))
                 }
             }
-            done(apps, Int(reply?["_c"]?["AppCountKey"]?.int ?? 0))
+            done(apps, Int(min(300, max(0, reply?["_c"]?["AppCountKey"]?.int ?? 0))))   // a sane cap
         }
     }
 

@@ -50,7 +50,7 @@ func session(_ r: Remote, linger: Double = 0.5, _ body: @escaping @MainActor () 
                 print("power: \(r.power)")
                 exit(0)
             }
-        case .failed(let e): die(e)
+        case .failed(let e): die(e.description)
         case .unpaired: die("\(r.device.name) doesn't recognize this pairing anymore: tvctl pair \(r.device.name)")
         default: break
         }
@@ -64,22 +64,7 @@ func session(_ r: Remote, linger: Double = 0.5, _ body: @escaping @MainActor () 
 let controlPath = CredentialStore.defaultURL.deletingLastPathComponent().appending(path: "control.sock").path
 
 /// Connects to the app's socket; nil if it isn't listening.
-func connectToApp() -> Int32? {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else { return nil }
-    var addr = sockaddr_un()
-    addr.sun_family = sa_family_t(AF_UNIX)
-    withUnsafeMutableBytes(of: &addr.sun_path) { raw in
-        let b = Array(controlPath.utf8.prefix(raw.count - 1))
-        raw.copyBytes(from: b)
-        raw[b.count] = 0
-    }
-    let ok = withUnsafePointer(to: &addr) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
-    }
-    if ok != 0 { close(fd); return nil }
-    return fd
-}
+func connectToApp() -> Int32? { UnixSocket.connect(controlPath) }
 
 /// Sends a command to the app (starting it if needed), prints its reply, exits with its code.
 func viaApp(_ args: [String]) -> Never {
@@ -175,7 +160,7 @@ MainActor.assumeIsolated {
                 }
             case .connected:
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { print("power: \(r.power)"); exit(0) }
-            case .failed(let e): die(e)
+            case .failed(let e): die(e.description)
             default: break
             }
         }
@@ -203,13 +188,10 @@ MainActor.assumeIsolated {
         // tvctl raw <_i> [key=value …]: value is an int, a double (has a "."), true/false,
         // or a string. Prints the reply. `event` sends it as an event (no reply).
         guard let id = args.first else { die("usage: tvctl raw <_i> [key=value …]") }
-        var content: [String: OPACK.Value] = [:]
-        for kv in args.dropFirst() {
-            let p = kv.split(separator: "=", maxSplits: 1).map(String.init)
-            guard p.count == 2 else { die("bad argument \(kv)") }
-            let v = p[1]
-            content[p[0]] = if let i = Int64(v) { .int(i) } else if v.contains("."), let d = Double(v) { .double(d) }
-                else if v == "true" || v == "false" { .bool(v == "true") } else { .string(v) }
+        let content: [String: OPACK.Value]
+        switch OPACK.arguments(args.dropFirst()) {
+        case .success(let c): content = c
+        case .failure(let e): die(e.description)
         }
         let r = remote(tv)
         session(r, linger: 1.5) {

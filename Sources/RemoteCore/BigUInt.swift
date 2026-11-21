@@ -20,27 +20,12 @@ struct BigUInt: Equatable {
         self.init(limbs: out)
     }
 
+    /// From hex, ignoring spaces and newlines; an odd digit count gets a leading zero.
     init?(hex: String) {
-        var bytes: [UInt8] = []
-        var chars = Array(hex.utf8.filter { $0 != 32 && $0 != 10 })
-        if chars.count % 2 == 1 { chars.insert(48, at: 0) }
-        bytes.reserveCapacity(chars.count / 2)
-        var k = 0
-        while k < chars.count {
-            guard let hi = BigUInt.nibble(chars[k]), let lo = BigUInt.nibble(chars[k + 1]) else { return nil }
-            bytes.append(hi << 4 | lo)
-            k += 2
-        }
+        var digits = String(hex.filter { $0 != " " && $0 != "\n" })
+        if digits.count % 2 == 1 { digits = "0" + digits }
+        guard let bytes = Hex.decode(digits) else { return nil }
         self.init(bytes: bytes)
-    }
-
-    private static func nibble(_ c: UInt8) -> UInt8? {
-        switch c {
-        case 48...57: c - 48
-        case 97...102: c - 87
-        case 65...70: c - 55
-        default: nil
-        }
     }
 
     var isZero: Bool { limbs.allSatisfy { $0 == 0 } }

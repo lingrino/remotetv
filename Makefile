@@ -11,14 +11,13 @@
 APP        := build/RemoteTV.app
 INSTALLED  := /Applications/RemoteTV.app
 
-.PHONY: all app install run test lint check clean signing tvctl
+.PHONY: all app install run test lint check clean tvctl
 
 all: app
 
-signing:
-	@[ -n "$$REMOTETV_SIGN_IDENTITY" ] || ./scripts/setup-signing.sh --check
-
-app: signing
+# Signing: the owner's Developer ID when scripts/setup-signing.sh has set it up, else
+# ad-hoc (scripts/bundle.sh says which). REMOTETV_SIGN_IDENTITY overrides.
+app:
 	./scripts/swift.sh build -c release --product RemoteTV
 	./scripts/swift.sh build -c release --product tvctl
 	./scripts/bundle.sh release "$(APP)"

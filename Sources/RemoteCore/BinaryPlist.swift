@@ -67,16 +67,21 @@ public enum Plist: Equatable, Sendable {
 
     // MARK: - Reading
 
+    /// Decodes untrusted bytes: every integer taken from the input is range-checked
+    /// before use, and the number of objects materialized is capped (a plist can reference
+    /// the same object from many places, so a small file could otherwise expand
+    /// exponentially).
     public static func decode(_ bytes: [UInt8]) throws(ProtocolError) -> Plist {
         let r = try Reader(bytes)
         return try r.object(r.top, depth: 0)
     }
 
-    private struct Reader {
+    private final class Reader {
         let b: [UInt8]
         let offsets: [Int]
         let refSize: Int
         let top: Int
+        private var budget = 100_000
 
         init(_ bytes: [UInt8]) throws(ProtocolError) {
             b = bytes
@@ -84,17 +89,17 @@ public enum Plist: Equatable, Sendable {
             let t = b.count - 32
             let offSize = Int(b[t + 6])
             refSize = Int(b[t + 7])
-            let count = Int(Reader.be(b[(t + 8)..<(t + 16)]))
-            top = Int(Reader.be(b[(t + 16)..<(t + 24)]))
-            let table = Int(Reader.be(b[(t + 24)..<(t + 32)]))
-            guard (1...8).contains(offSize), (1...8).contains(refSize), count > 0, count < 1 << 20, top < count,
+            let count = try Reader.int(b[(t + 8)..<(t + 16)], below: 1 << 20)
+            top = try Reader.int(b[(t + 16)..<(t + 24)], below: count)
+            let table = try Reader.int(b[(t + 24)..<(t + 32)], below: t)
+            guard (1...8).contains(offSize), (1...8).contains(refSize), count > 0,
                   table >= 8, table + count * offSize <= t else { throw .malformed("plist trailer") }
             var o: [Int] = []
             o.reserveCapacity(count)
             for i in 0..<count {
                 let s = table + i * offSize
-                let v = Int(Reader.be(b[s..<(s + offSize)]))
-                guard v >= 8, v < table else { throw .malformed("plist offset") }
+                let v = try Reader.int(b[s..<(s + offSize)], below: table)
+                guard v >= 8 else { throw .malformed("plist offset") }
                 o.append(v)
             }
             offsets = o
@@ -104,6 +109,14 @@ public enum Plist: Equatable, Sendable {
             var v: UInt64 = 0
             for x in s { v = v << 8 | UInt64(x) }
             return v
+        }
+
+        /// A big-endian unsigned field as an Int in 0..<limit, or a malformed error.
+        static func int(_ s: ArraySlice<UInt8>, below limit: Int) throws(ProtocolError) -> Int {
+            guard s.count <= 8 else { throw .malformed("plist integer too wide") }
+            let v = be(s)
+            guard v < UInt64(max(0, limit)) else { throw .malformed("plist integer out of range") }
+            return Int(v)
         }
 
         private func slice(_ at: Int, _ n: Int) throws(ProtocolError) -> ArraySlice<UInt8> {
@@ -118,9 +131,9 @@ public enum Plist: Equatable, Sendable {
             let m = try slice(at + 1, 1).first!
             guard m >> 4 == 0x1 else { throw .malformed("plist count") }
             let n = 1 << Int(m & 0x0F)
-            let v = Reader.be(try slice(at + 2, n))
-            guard v < 1 << 28 else { throw .malformed("plist count too large") }
-            return (Int(v), at + 2 + n)
+            guard n <= 8 else { throw .malformed("plist count") }
+            let v = try Reader.int(try slice(at + 2, n), below: b.count)   // a count can't exceed the file
+            return (v, at + 2 + n)
         }
 
         private func refs(_ at: Int, _ n: Int) throws(ProtocolError) -> [Int] {
@@ -129,9 +142,7 @@ public enum Plist: Equatable, Sendable {
             out.reserveCapacity(n)
             var i = s.startIndex
             for _ in 0..<n {
-                let r = Int(Reader.be(s[i..<(i + refSize)]))
-                guard r < offsets.count else { throw .malformed("plist reference") }
-                out.append(r)
+                out.append(try Reader.int(s[i..<(i + refSize)], below: offsets.count))
                 i += refSize
             }
             return out
@@ -139,6 +150,8 @@ public enum Plist: Equatable, Sendable {
 
         func object(_ index: Int, depth: Int) throws(ProtocolError) -> Plist {
             guard depth < 64 else { throw .malformed("plist nesting") }
+            budget -= 1
+            guard budget >= 0 else { throw .malformed("plist too many objects") }
             let at = offsets[index]
             let m = b[at]
             switch m >> 4 {
@@ -155,6 +168,7 @@ public enum Plist: Equatable, Sendable {
                 return .int(Int64(bitPattern: Reader.be(s.suffix(8))))
             case 0x2, 0x3:
                 let n = 1 << Int(m & 0x0F)
+                guard n == 4 || n == 8 else { throw .malformed("plist real size") }
                 let s = try slice(at + 1, n)
                 let v = n == 4 ? Double(Float(bitPattern: UInt32(Reader.be(s)))) : Double(bitPattern: Reader.be(s))
                 return m >> 4 == 0x2 ? .real(v) : .date(v)
@@ -174,12 +188,13 @@ public enum Plist: Equatable, Sendable {
                 return .string(String(decoding: units, as: UTF16.self))
             case 0x8:
                 let n = Int(m & 0x0F) + 1
-                return .uid(Int(Reader.be(try slice(at + 1, n))))
+                return .uid(try Reader.int(try slice(at + 1, n), below: 1 << 32))
             case 0xA:
                 let (n, p) = try count(at)
+                let r = try refs(p, n)   // validates n against the bytes before reserving
                 var out: [Plist] = []
                 out.reserveCapacity(n)
-                for r in try refs(p, n) { out.append(try object(r, depth: depth + 1)) }
+                for i in r { out.append(try object(i, depth: depth + 1)) }
                 return .array(out)
             case 0xD:
                 let (n, p) = try count(at)
@@ -297,7 +312,7 @@ public struct KeyedArchive {
     public func resolve(_ v: Plist?) -> Plist? {
         guard var v else { return nil }
         var hops = 0
-        while case .uid(let u) = v, u < objects.count, hops < 8 { v = objects[u]; hops += 1 }
+        while case .uid(let u) = v, u >= 0, u < objects.count, hops < 8 { v = objects[u]; hops += 1 }
         if case .string("$null") = v { return nil }
         return v
     }

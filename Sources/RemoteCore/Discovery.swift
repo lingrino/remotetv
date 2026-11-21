@@ -18,7 +18,7 @@ public struct Device: Sendable, Hashable, Identifiable {
         self.endpoint = Device.endpoint(name: name)
     }
 
-    init(name: String, model: String, endpoint: NWEndpoint) {
+    public init(name: String, model: String, endpoint: NWEndpoint) {
         self.name = name
         self.model = model
         self.endpoint = endpoint
