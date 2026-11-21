@@ -18,6 +18,32 @@ public enum Button: Int, Sendable, CaseIterable {
     case pageUp = 18, pageDown = 19
 }
 
+extension Button {
+    /// Lowercase names for scripting ("playpause", "volumeup", "back" = menu, "tv" = home).
+    public static func named(_ name: String) -> Button? {
+        switch name.lowercased() {
+        case "up": .up
+        case "down": .down
+        case "left": .left
+        case "right": .right
+        case "select", "ok": .select
+        case "menu", "back": .menu
+        case "home", "tv": .home
+        case "volumeup": .volumeUp
+        case "volumedown": .volumeDown
+        case "playpause", "play", "pause": .playPause
+        case "siri": .siri
+        case "screensaver": .screensaver
+        case "guide": .guide
+        case "pageup": .pageUp
+        case "pagedown": .pageDown
+        case "channelup": .channelUp
+        case "channeldown": .channelDown
+        default: nil
+        }
+    }
+}
+
 public enum PowerState: Sendable, Equatable {
     case unknown, asleep, awake
 }
@@ -55,6 +81,11 @@ public final class Remote {
         case pairing
         case connected
         case failed(String)
+
+        public var isFailure: Bool {
+            if case .failed = self { return true }
+            return false
+        }
     }
 
     public let device: Device

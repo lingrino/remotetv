@@ -21,13 +21,6 @@ func stamp(_ d: Duration) -> String {
     return String(format: "%.1f ms", ms)
 }
 
-let buttons: [String: Button] = [
-    "up": .up, "down": .down, "left": .left, "right": .right, "select": .select, "menu": .menu,
-    "back": .menu, "home": .home, "tv": .home, "volumeup": .volumeUp, "volumedown": .volumeDown,
-    "playpause": .playPause, "siri": .siri, "screensaver": .screensaver, "guide": .guide,
-    "pageup": .pageUp, "pagedown": .pageDown, "channelup": .channelUp, "channeldown": .channelDown,
-]
-
 @MainActor
 func remote(_ name: String?) -> Remote {
     let store = CredentialStore()
@@ -110,7 +103,7 @@ MainActor.assumeIsolated {
 
     case "press":
         let list = args.map { a -> Button in
-            guard let b = buttons[a.lowercased()] else { die("unknown button \(a)") }
+            guard let b = Button.named(a) else { die("unknown button \(a)") }
             return b
         }
         let r = remote(tv)

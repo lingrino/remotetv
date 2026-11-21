@@ -34,6 +34,17 @@
 	<false/>
 	<key>NSSupportsSuddenTermination</key>
 	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.lingrino.remotetv</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>remotetv</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>RemoteTV finds and controls the Apple TVs on your network.</string>
 	<key>NSBonjourServices</key>

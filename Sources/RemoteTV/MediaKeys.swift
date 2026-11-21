@@ -17,8 +17,9 @@ final class MediaKeys {
         case rewind = 20       // NX_KEYTYPE_REWIND
     }
 
-    /// (key, isDown, isRepeat). Called on the main thread from the tap.
-    var handler: ((Key, Bool, Bool) -> Void)?
+    /// (key, isDown, isRepeat) → handled. Called on the main thread from the tap; keys it
+    /// doesn't handle go on to macOS.
+    var handler: ((Key, Bool, Bool) -> Bool)?
 
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
@@ -81,7 +82,7 @@ final class MediaKeys {
         guard let key = Key(rawValue: code) else { return Unmanaged.passUnretained(event) }
         let down = (flags & 0xFF00) >> 8 == 0xA   // 0xA down, 0xB up
         let rep = flags & 1 == 1
-        MainActor.assumeIsolated { current?.handler?(key, down, rep) }
-        return nil
+        let handled = MainActor.assumeIsolated { current?.handler?(key, down, rep) ?? false }
+        return handled ? nil : Unmanaged.passUnretained(event)
     }
 }
