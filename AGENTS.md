@@ -23,13 +23,15 @@ This file is the agent guide (Claude Code reads it when there is no CLAUDE.md; d
 - Local git repo at first, then GitHub (lingrino/remotetv), released through the
   owner's Homebrew tap like fred and peep (see CI and releases).
 
-Round 7 (2026-11-21): on GitHub, **private until the owner makes it public** (they
-asked to stop before that step). Repo, ruleset and secrets are Terraform in lingrino/infra
-(#3043, #3044); CI and releases copied from autotouch/fred. Still to do, in order: the
-infra PR that makes it public (visibility and the selected-actions list, like autotouch's
-#3041), then secret scanning in its own PR (#3042's shape); the next merge after that
-publishes `Casks/remotetv.rb` in lingrino/homebrew-tap; then lingrino/dotfiles#16 (draft)
-installs it on the personal Mac and the mini. No AI attribution in commits or PRs, ever.
+Round 7 (2026-11-21): published. Public GitHub repo (lingrino/remotetv); repo, ruleset,
+secrets and secret scanning are Terraform in lingrino/infra (#3043–#3046), in autotouch's
+order (private first, branch resources after the first push, public, then secret
+scanning). CI and releases copied from autotouch/fred; every merge publishes
+`Casks/remotetv.rb` in lingrino/homebrew-tap, and lingrino/dotfiles installs it on the
+personal Mac and the mini. README: the owner's text plus `docs/remote.png` (the real
+window, dark mode, sidebar closed, nothing playing: `screencapture -l <window id>` with
+RemoteTV frontmost; `tvctl snapshot` can't render Liquid Glass). No AI attribution in
+commits or PRs, ever.
 
 Round 6 (2026-11-20): an independent full review (another model, all files) before going
 public on GitHub; its findings were fixed (see Security and Reliability). Next: publish.
