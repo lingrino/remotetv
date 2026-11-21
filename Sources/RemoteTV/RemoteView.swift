@@ -1,29 +1,31 @@
 import AppKit
 import RemoteCore
 
-/// The window's content: header (TV name, status, power), clickpad, skip, transport row,
-/// volume, and the pairing panel in place of the controls when pairing. Fixed layout in a
-/// flipped coordinate space; all sizes come from `Theme`.
+/// The window's content, top to bottom: TV name (menu), now-playing strip (title +
+/// scrubber, or the text field when the TV wants text), clickpad with skip ±10 in its
+/// lower corners, Play/Pause · Back · TV, then Power · volume · Captions. The pairing
+/// panel replaces everything below the name while pairing. Fixed layout, flipped
+/// coordinates; sizes from `Theme`.
 final class RemoteView: NSView {
-    // Header
     let title = NSButton(title: "", target: nil, action: nil)
-    let status = NSTextField(labelWithString: "")
-    let power = GlassButton(symbol: "power", label: "Power", diameter: 30, pointSize: 13)
+    let strip = NowPlayingStrip(frame: NSRect(x: 0, y: 28, width: Theme.width, height: 46))
+    let text = TextEntry(frame: NSRect(x: 16, y: 32, width: Theme.width - 32, height: 34))
 
-    // Controls
     let pad = ClickPad(diameter: Theme.padDiameter)
     let skipBack = IconButton(symbol: "gobackward.10", label: "Back 10 seconds")
     let skipForward = IconButton(symbol: "goforward.10", label: "Forward 10 seconds")
     let playPause = GlassButton(symbol: "playpause.fill", label: "Play/Pause")
     let back = GlassButton(symbol: "chevron.left", label: "Back", diameter: Theme.buttonDiameter + 10, pointSize: 24)
     let home = GlassButton(symbol: "tv", label: "TV")
-    let volume = SplitPill(width: 172, height: 48, first: "minus", second: "plus", middle: "speaker.wave.2.fill",
+    let power = GlassButton(symbol: "power", label: "Sleep", diameter: 44, pointSize: 16)
+    let volume = SplitPill(width: 112, height: 44, first: "minus", second: "plus", middle: "speaker.wave.2.fill",
                            labels: ("Volume Down", "Volume Up"))
+    let captions = GlassButton(symbol: "captions.bubble", label: "Subtitles", diameter: 44, pointSize: 16)
 
     let pairing = PairingView()
-    private lazy var controls: [NSView] = [pad, skipBack, skipForward, playPause, back, home, volume]
+    private lazy var controls: [NSView] = [strip, pad, skipBack, skipForward, playPause, back, home, power, volume, captions]
 
-    static let height: CGFloat = 476
+    static let height: CGFloat = 512
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -47,17 +49,11 @@ final class RemoteView: NSView {
         title.alignment = .center
         addSubview(title)
 
-        status.font = .systemFont(ofSize: 11)
-        status.textColor = .secondaryLabelColor
-        status.alignment = .center
-        status.lineBreakMode = .byTruncatingTail
-        status.frame = NSRect(x: 16, y: 26, width: w - 32, height: 16)
-        addSubview(status)
+        addSubview(strip)
+        text.isHidden = true
+        addSubview(text)
 
-        power.frame.origin = NSPoint(x: w - 30 - 10, y: 1)
-        addSubview(power)
-
-        let padTop: CGFloat = 50
+        let padTop: CGFloat = 82
         pad.frame.origin = NSPoint(x: (w - Theme.padDiameter) / 2, y: padTop)
         addSubview(pad)
         skipBack.frame.origin = NSPoint(x: 14, y: padTop + Theme.padDiameter - 34)
@@ -65,16 +61,19 @@ final class RemoteView: NSView {
         addSubview(skipBack)
         addSubview(skipForward)
 
-        let rowCenter = padTop + Theme.padDiameter + 26 + back.frame.height / 2
+        let rowCenter = padTop + Theme.padDiameter + 24 + back.frame.height / 2
         back.frame.origin = NSPoint(x: (w - back.frame.width) / 2, y: rowCenter - back.frame.height / 2)
         playPause.frame.origin = NSPoint(x: w / 2 - 88 - playPause.frame.width / 2, y: rowCenter - playPause.frame.height / 2)
         home.frame.origin = NSPoint(x: w / 2 + 88 - home.frame.width / 2, y: rowCenter - home.frame.height / 2)
         for v in [playPause, back, home] { addSubview(v) }
 
-        volume.frame.origin = NSPoint(x: (w - volume.frame.width) / 2, y: rowCenter + back.frame.height / 2 + 24)
-        addSubview(volume)
+        let bottom = rowCenter + back.frame.height / 2 + 22
+        volume.frame.origin = NSPoint(x: (w - volume.frame.width) / 2, y: bottom)
+        power.frame.origin = NSPoint(x: w / 2 - 88 - power.frame.width / 2, y: bottom)
+        captions.frame.origin = NSPoint(x: w / 2 + 88 - captions.frame.width / 2, y: bottom)
+        for v in [power, volume, captions] as [NSView] { addSubview(v) }
 
-        pairing.frame = NSRect(x: 0, y: padTop, width: w, height: RemoteView.height - padTop)
+        pairing.frame = NSRect(x: 0, y: 50, width: w, height: RemoteView.height - 50)
         pairing.isHidden = true
         addSubview(pairing)
     }
@@ -86,7 +85,27 @@ final class RemoteView: NSView {
         set {
             pairing.isHidden = !newValue
             for v in controls { v.isHidden = newValue }
+            if newValue { text.isHidden = true }
         }
+    }
+
+    /// The TV's text field mirrored here (nil: back to the now-playing strip).
+    func showText(_ on: Bool) {
+        text.isHidden = !on
+        strip.isHidden = on || showsPairing
+    }
+
+    func setCaptions(available: Bool, on: Bool) {
+        captions.alphaValue = available ? 1 : 0.35
+        captions.symbol = on ? "captions.bubble.fill" : "captions.bubble"
+        captions.tint = on ? .controlAccentColor : nil
+        captions.toolTip = available ? (on ? "Subtitles On" : "Subtitles Off") : "No subtitles for this"
+    }
+
+    func setPower(asleep: Bool) {
+        power.tint = asleep ? .tertiaryLabelColor : nil
+        power.setAccessibilityLabel(asleep ? "Wake" : "Sleep")
+        power.toolTip = asleep ? "Wake" : "Sleep"
     }
 
     override func keyDown(with event: NSEvent) {
@@ -96,6 +115,135 @@ final class RemoteView: NSView {
     override func keyUp(with event: NSEvent) {
         if onKey?(event, false) != true { super.keyUp(with: event) }
     }
+}
+
+/// Title and a scrubber for what's playing; status text ("Connecting…", "Not Playing")
+/// in the title line otherwise.
+final class NowPlayingStrip: NSView {
+    let label = NSTextField(labelWithString: "")
+    let slider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    let elapsed = NSTextField(labelWithString: "")
+    let remaining = NSTextField(labelWithString: "")
+    /// Seek requested (seconds), on release.
+    var onSeek: ((Double) -> Void)?
+    private(set) var scrubbing = false
+
+    override var isFlipped: Bool { true }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        let w = frame.width
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+        label.frame = NSRect(x: 20, y: 0, width: w - 40, height: 16)
+        addSubview(label)
+
+        let digits = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        for l in [elapsed, remaining] {
+            l.font = digits
+            l.textColor = .tertiaryLabelColor
+            addSubview(l)
+        }
+        elapsed.alignment = .right
+        remaining.alignment = .left
+        elapsed.frame = NSRect(x: 4, y: 24, width: 44, height: 14)
+        remaining.frame = NSRect(x: w - 48, y: 24, width: 44, height: 14)
+
+        slider.controlSize = .small
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(slid)
+        slider.refusesFirstResponder = true
+        slider.frame = NSRect(x: 52, y: 20, width: w - 104, height: 20)
+        addSubview(slider)
+        show(nil, status: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Updates for an item (nil: nothing playing) or a connection status line.
+    func show(_ np: NowPlaying?, status: String?) {
+        if let status {
+            label.stringValue = status
+            label.textColor = .secondaryLabelColor
+        } else if let np {
+            label.stringValue = [np.title, np.subtitle].compactMap { $0 }.joined(separator: " — ")
+            label.textColor = .labelColor
+        } else {
+            label.stringValue = "Not Playing"
+            label.textColor = .tertiaryLabelColor
+        }
+        let seekable = status == nil && (np?.duration ?? 0) > 0
+        slider.isHidden = !seekable
+        elapsed.isHidden = !seekable
+        remaining.isHidden = !seekable
+        if let np, seekable, let d = np.duration {
+            slider.maxValue = d
+            tick(np)
+        }
+    }
+
+    /// Moves the knob to the extrapolated position (not while the user drags it).
+    func tick(_ np: NowPlaying) {
+        guard !scrubbing, let d = np.duration, d > 0 else { return }
+        let p = np.position()
+        slider.doubleValue = p
+        setTimes(p, d)
+    }
+
+    private func setTimes(_ p: Double, _ d: Double) {
+        elapsed.stringValue = NowPlayingStrip.clock(p)
+        remaining.stringValue = "-" + NowPlayingStrip.clock(max(0, d - p))
+    }
+
+    @objc private func slid() {
+        let type = NSApp.currentEvent?.type
+        scrubbing = type == .leftMouseDown || type == .leftMouseDragged
+        setTimes(slider.doubleValue, slider.maxValue)
+        if !scrubbing { onSeek?(slider.doubleValue) }
+    }
+
+    /// 0:07 · 12:34 · 1:02:03
+    static func clock(_ seconds: Double) -> String {
+        let t = Int(seconds.rounded(.down))
+        let h = t / 3600, m = t / 60 % 60, s = t % 60
+        let ss = s < 10 ? "0\(s)" : "\(s)"
+        if h > 0 { return "\(h):\(m < 10 ? "0\(m)" : "\(m)"):\(ss)" }
+        return "\(m):\(ss)"
+    }
+}
+
+/// The TV's focused text field, mirrored: edits here replace the TV field's text live.
+/// Return or Escape hands the keyboard back to the remote.
+final class TextEntry: NSTextField {
+    var onEdit: ((String) -> Void)?
+    var onDone: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        font = .systemFont(ofSize: 15)
+        placeholderString = "Type on the TV"
+        bezelStyle = .roundedBezel
+        focusRingType = .default
+        cell?.sendsActionOnEndEditing = false
+        cell?.usesSingleLineMode = true
+        cell?.lineBreakMode = .byTruncatingHead
+        target = self
+        action = #selector(returned)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func textDidChange(_ notification: Notification) {
+        super.textDidChange(notification)
+        onEdit?(stringValue)
+    }
+
+    @objc private func returned() { onDone?() }
+
+    override func cancelOperation(_ sender: Any?) { onDone?() }
 }
 
 /// Pairing: pick an Apple TV, then type the PIN it shows.

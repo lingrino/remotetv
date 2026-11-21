@@ -99,14 +99,25 @@ public final class Remote {
     }
     public private(set) var power: PowerState = .unknown { didSet { if power != oldValue { onPower?(power) } } }
     public private(set) var controls: MediaControls = []
+    /// What's playing (nil: nothing, or not known yet).
+    public private(set) var nowPlaying: NowPlaying?
+    /// The TV's focused text field, if any.
+    public private(set) var textSession: TextSession?
 
     public var onStatus: ((Status) -> Void)?
     public var onPower: ((PowerState) -> Void)?
     public var onPaired: ((Credentials) -> Void)?
-    /// The TV opened (true) or closed (false) a text field.
-    public var onTextInput: ((Bool) -> Void)?
+    /// The TV focused (session) or left (nil) a text field.
+    public var onTextSession: ((TextSession?) -> Void)?
+    public var onNowPlaying: ((NowPlaying?) -> Void)?
+    /// Media-control flags changed (`controls`).
+    public var onControls: ((MediaControls) -> Void)?
     /// Connect → pair-verify done → handshake sent, for latency logging.
     public var onTiming: ((String, Duration) -> Void)?
+    /// Every message sent (→) and received (←), decoded, for debugging (`tvctl -v`).
+    public var onTrace: ((String) -> Void)?
+    /// Every message received, decoded (exploration tools).
+    public var onMessage: ((OPACK.Value) -> Void)?
 
     /// How we introduce ourselves (`_systemInfo`, pairing name shown in the TV's settings).
     public var clientName = "RemoteTV"
@@ -128,6 +139,7 @@ public final class Remote {
     private var conn: Connection?
     private var xid = Int.random(in: 0..<0x8000)
     private var replies: [Int: (OPACK.Value) -> Void] = [:]
+    private var rawReplies: [Int: (OPACK.Value?, String?) -> Void] = [:]
     private var queued: [() -> Void] = []
     private var timeout: DispatchWorkItem?
     private var sid: UInt64 = 0
@@ -353,14 +365,21 @@ public final class Remote {
         request("TVRCSessionStart", count: 1) { w in
             w.string("ProtocolVersionKey"); w.string("1.2")
         }
+        // Text input: the reply carries the session if a text field is already focused
+        // (then no _tiStarted follows).
+        request("_tiStart", count: 0, { _ in }) { [weak self] reply in
+            self?.setTextSession(reply["_c"]?["_tiD"]?.data.flatMap(TextSession.init(archive:)))
+        }
         event("_interest", count: 1) { w in
-            let events = ["_iMC", "SystemStatus", "TVSystemStatus", "_tiStarted", "_tiStopped"]
+            let events = ["_iMC", "SystemStatus", "TVSystemStatus", "_tiStarted", "_tiStopped", "NowPlayingInfo"]
             w.string("_regEvents"); w.array(events.count)
             for e in events { w.string(e) }
         }
         request("FetchAttentionState", count: 0, { _ in }) { [weak self] reply in
             if let s = reply["_c"]?["state"]?.int { self?.systemStatus(s) }
         }
+        // The answer comes as a NowPlayingInfo event.
+        request("FetchCurrentNowPlayingInfoEvent", count: 0) { _ in }
         status = .connected
         onTiming?("session", ContinuousClock.now - started)
         let pending = queued
@@ -369,6 +388,8 @@ public final class Remote {
     }
 
     private func message(_ msg: OPACK.Value) {
+        onTrace?("← \(msg)")
+        onMessage?(msg)
         switch msg["_t"]?.int {
         case 1:   // event
             let content = msg["_c"]
@@ -376,25 +397,49 @@ public final class Remote {
             case "SystemStatus", "TVSystemStatus":
                 if let s = content?["state"]?.int { systemStatus(s) }
             case "_iMC":
-                if let f = content?["_mcF"]?.int { controls = MediaControls(rawValue: Int(f)) }
+                if let f = content?["_mcF"]?.int, Int(f) != controls.rawValue {
+                    controls = MediaControls(rawValue: Int(f))
+                    onControls?(controls)
+                }
+            case "NowPlayingInfo":
+                let np = content?["NowPlayingInfoKey"]?.data.flatMap(NowPlaying.init(archive:))
+                if np != nowPlaying {
+                    nowPlaying = np
+                    onNowPlaying?(np)
+                }
             case "_tiStarted":
-                onTextInput?(true)
+                setTextSession(content?["_tiD"]?.data.flatMap(TextSession.init(archive:)))
             case "_tiStopped":
-                onTextInput?(false)
+                setTextSession(nil)
             default:
                 break
             }
         case 3:   // response
             guard let x = msg["_x"]?.int else { return }
             let handler = replies.removeValue(forKey: Int(x))
-            if let em = msg["_em"]?.string {
-                Remote.log.notice("request failed: \(em, privacy: .public)")
+            // Errors: `_em` (message) and/or `_ec`/`_ed` (code, domain; -6714 = not handled).
+            let error: String? = msg["_em"]?.string ?? msg["_ec"]?.int.map { code in
+                let c = code > 0x7FFF && code <= 0xFFFF ? code - 0x10000 : code
+                return "\(msg["_ed"]?.string ?? "error") \(c)"
+            }
+            if let raw = rawReplies.removeValue(forKey: Int(x)) {
+                raw(error == nil ? msg : nil, error)
+                return
+            }
+            if let error {
+                Remote.log.notice("request failed: \(error, privacy: .public)")
                 return
             }
             handler?(msg)
         default:
             break
         }
+    }
+
+    private func setTextSession(_ s: TextSession?) {
+        guard s != textSession else { return }
+        textSession = s
+        onTextSession?(s)
     }
 
     private func systemStatus(_ s: Int64) {
@@ -415,6 +460,7 @@ public final class Remote {
         xid = (xid + 1) & 0x7FFF_FFFF
         w.string("_x"); w.int(x)
         if let reply { replies[x] = reply }
+        if let onTrace { onTrace("→ \((try? OPACK.decode(w.bytes)).map { "\($0)" } ?? "?")") }
         conn.send(.encryptedOPACK, w.bytes)
     }
 
@@ -445,6 +491,26 @@ public final class Remote {
 
     // MARK: - Commands
 
+    /// Any request, for exploring the protocol (`tvctl raw`). The reply (or nil on `_em`
+    /// error) goes to `reply` with the error text.
+    public func raw(_ id: String, _ content: [String: OPACK.Value], event: Bool = false,
+                    reply: ((OPACK.Value?, String?) -> Void)? = nil) {
+        whenConnected { [weak self] in
+            guard let self, let conn = self.conn else { return }
+            var w = OPACK.Writer()
+            w.dict(4)
+            w.string("_i"); w.string(id)
+            w.string("_t"); w.int(event ? 1 : 2)
+            w.string("_c"); w.value(.dict(content))
+            let x = self.xid
+            self.xid = (self.xid + 1) & 0x7FFF_FFFF
+            w.string("_x"); w.int(x)
+            if let reply { self.rawReplies[x] = reply }
+            self.onTrace?("→ \(id) \(content)")
+            conn.send(.encryptedOPACK, w.bytes)
+        }
+    }
+
     /// Button down or up. Holding a button (down … up) behaves like holding the Siri
     /// Remote's: scrolling repeats, long-press menus open.
     public func button(_ b: Button, down: Bool) {
@@ -469,6 +535,49 @@ public final class Remote {
                 w.string("_mcc"); w.int(7)
                 w.string("_skpS"); w.double(seconds)
             }
+        }
+    }
+
+    /// Jumps to `seconds` into the playing item (as a relative skip from the current
+    /// extrapolated position; Companion has no absolute seek).
+    public func seek(to seconds: Double) {
+        guard let np = nowPlaying else { return }
+        let delta = seconds - np.position()
+        guard abs(delta) >= 0.5 else { return }
+        skip(delta)
+        // Show the new position right away; the TV's own snapshot follows.
+        var moved = np
+        moved.elapsed = max(0, seconds)
+        moved.timestamp = Date().timeIntervalSinceReferenceDate
+        nowPlaying = moved
+        onNowPlaying?(moved)
+    }
+
+    /// Asks for a fresh now-playing snapshot (arrives via `onNowPlaying`).
+    public func refreshNowPlaying() {
+        guard case .session = phase else { return }
+        request("FetchCurrentNowPlayingInfoEvent", count: 0) { _ in }
+    }
+
+    /// Subtitles on/off for the playing item (when it has caption tracks).
+    public func toggleCaptions() {
+        whenConnected { [weak self] in
+            self?.request("ToggleCaptions", count: 0) { _ in }
+        }
+        if var np = nowPlaying {
+            np.captionsEnabled.toggle()
+            nowPlaying = np
+            onNowPlaying?(np)
+        }
+    }
+
+    /// Replaces the focused TV text field's contents with `text`.
+    public func setText(_ text: String) {
+        guard let s = textSession, case .session = phase else { return }
+        let ops = RTI.operations(session: s.uuid, replaceWith: text)
+        event("_tiC", count: 2) { w in
+            w.string("_tiV"); w.int(1)
+            w.string("_tiD"); w.data(ops)
         }
     }
 

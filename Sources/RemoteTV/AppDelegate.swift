@@ -84,11 +84,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if !view.showsPairing { window.makeFirstResponder(view) }
         NSApp.activate()
         reconnectIfNeeded()
+        remote?.refreshNowPlaying()
+        updateTicker()
     }
 
     private func hide() {
         releaseAll()
         window.orderOut(nil)
+        updateTicker()
         NSApp.hide(nil)
         idleItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
@@ -174,13 +177,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.delegate = self
         window.contentView = view
         window.animationBehavior = .none
-        if !window.setFrameUsingName("Remote") { window.center() }
+        // Restore the position (keeping the top edge) but never a stale size from an
+        // older layout.
+        let restored = window.setFrameUsingName("Remote")
+        let size = window.frameRect(forContentRect: NSRect(origin: .zero, size: view.frame.size)).size
+        var f = window.frame
+        if restored { f.origin.y += f.height - size.height }
+        f.size = size
+        window.setFrame(f, display: false)
+        if !restored { window.center() }
         window.setFrameAutosaveName("Remote")
 
         view.onKey = { [weak self] e, down in self?.key(e, down: down) ?? false }
         view.title.target = self
         view.title.action = #selector(showDeviceMenu)
         view.power.onPress = { [weak self] down in if !down { self?.remote?.togglePower() } }
+        view.captions.onPress = { [weak self] down in
+            if !down, self?.remote?.nowPlaying?.hasCaptions == true { self?.remote?.toggleCaptions() }
+        }
+        view.strip.onSeek = { [weak self] t in self?.remote?.seek(to: t) }
+        view.text.onEdit = { [weak self] t in self?.remote?.setText(t) }
+        view.text.onDone = { [weak self] in
+            guard let self else { return }
+            self.window.makeFirstResponder(self.view)
+        }
         view.pad.onButton = { [weak self] b, down in self?.remote?.button(b, down: down) }
         view.pad.onTouch = { [weak self] x, y, phase in self?.remote?.touch(x: x, y: y, phase: phase) }
         view.skipBack.onPress = { [weak self] down in if down { self?.remote?.skip(-10) } }
@@ -226,6 +246,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         r.onPower = { [weak self, weak r] _ in
             guard let self, let r, r === self.remote else { return }
             self.updateHeader()
+        }
+        r.onNowPlaying = { [weak self, weak r] _ in
+            guard let self, let r, r === self.remote else { return }
+            self.updateHeader()
+        }
+        r.onTextSession = { [weak self, weak r] s in
+            guard let self, let r, r === self.remote else { return }
+            self.textSessionChanged(s)
         }
         r.onTiming = { what, d in
             if what == "session" { Launch.mark("connected") }
@@ -288,21 +316,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard window != nil else { return }
         guard let r = remote, !view.showsPairing else {
             view.title.title = "RemoteTV"
-            view.status.stringValue = ""
-            view.power.isHidden = true
             return
         }
         view.title.title = r.device.name
-        view.power.isHidden = false
-        view.status.stringValue = switch r.status {
-        case .connected, .idle: ""
+        let status: String? = switch r.status {
+        case .connected, .idle: nil
         case .connecting, .pairing: "Connecting…"
         case .waitingForPIN: "Pairing…"
         case .failed(let e): e.prefix(1).uppercased() + e.dropFirst()
         }
-        view.power.tint = r.power == .asleep ? .tertiaryLabelColor : .labelColor
-        view.power.setAccessibilityLabel(r.power == .asleep ? "Wake" : "Sleep")
-        view.power.toolTip = r.power == .asleep ? "Wake" : "Sleep"
+        view.strip.show(status == nil ? r.nowPlaying : nil, status: status)
+        view.setPower(asleep: r.power == .asleep)
+        let np = r.nowPlaying
+        view.setCaptions(available: np?.hasCaptions ?? false, on: np?.captionsEnabled ?? false)
+        updateTicker()
+    }
+
+    // MARK: - Now playing and text
+
+    private var ticker: Timer?
+
+    /// Moves the scrubber while something plays and the window is visible (2 Hz; the
+    /// position is extrapolated locally, nothing is sent).
+    private func updateTicker() {
+        let run = window?.isVisible == true && remote?.nowPlaying?.isPlaying == true && remote?.status == .connected
+        if run && ticker == nil {
+            let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let np = self.remote?.nowPlaying else { return }
+                    self.view.strip.tick(np)
+                }
+            }
+            t.tolerance = 0.1
+            RunLoop.main.add(t, forMode: .common)
+            ticker = t
+        } else if !run {
+            ticker?.invalidate()
+            ticker = nil
+        }
+    }
+
+    private func textSessionChanged(_ s: TextSession?) {
+        guard window != nil else { return }
+        if let s {
+            view.text.stringValue = s.text
+            view.showText(true)
+            window.makeFirstResponder(view.text)
+            view.text.currentEditor()?.selectedRange = NSRange(location: (s.text as NSString).length, length: 0)
+        } else {
+            let editing = window.firstResponder === view.text.currentEditor()
+            view.showText(false)
+            if editing || window.firstResponder === view.text { window.makeFirstResponder(view) }
+        }
     }
 
     // MARK: - Device menu and browsing
@@ -464,6 +529,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard let r = remote, !view.showsPairing else { return false }
         if e.modifierFlags.contains(.command) { return false }
         let code = e.keyCode
+        if code == 48, down, !view.text.isHidden {   // Tab: back into the TV's text field
+            window.makeFirstResponder(view.text)
+            return true
+        }
         let held: Button? = switch code {
         case 126: .up
         case 125: .down

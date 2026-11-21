@@ -22,6 +22,12 @@ This file is the agent guide (Claude Code reads it when there is no CLAUDE.md; d
   launcher). Launching it again must show it immediately.
 - Local git repo only for now (no remote, no CI, no releases).
 
+Round 2 (2026-11-20, after first use): "very nice". Power button moved from the title bar
+to the bottom row (it looked out of place there). Wanted: mute and subtitles like the iOS
+remote, typing into TV text fields, a native scrubber; now playing worth exploring if it's
+a natural extension. Done: subtitles, scrubber, now-playing title, text input (needs a live
+check). Mute needs the AirPlay/MRP tunnel (not started; see Protocol notes).
+
 ## Build, run, test
 
 ```
@@ -41,9 +47,16 @@ Privacy grants are keyed on bundle id + team, so they survive every rebuild.
 
 ### Live testing
 
-- `tvctl scan | pair <tv> | status | press [tv:] down select … | skip 10 | sleep | wake`
-  shares the app's pairing store; use it to test protocol changes without the UI.
-  `tvctl status` prints the connect timings.
+- `tvctl scan | pair <tv> | status | press [tv:] down select … | skip 10 | seek 1234 | np |
+  captions | text <s> | sleep | wake` shares the app's pairing store; use it to test protocol
+  changes without the UI. `tvctl status` prints the connect timings; `tvctl -v …` traces
+  every message. Exploration: `tvctl raw <_i> key=value…` (prints the reply) and
+  `tvctl listen <s> <event>… +<request>… !<button>…` (TVCTL_DUMP=dir writes every binary
+  plist received, decode with plistlib).
+- **The TV keeps one connection per pairing identity**: tvctl and the app share one, so
+  they kick each other off (the app then reconnects within 0.3 s and kicks tvctl). Quit
+  the app (`pkill -x RemoteTV`) while using tvctl; `open -g -a /Applications/RemoteTV.app`
+  after.
 - The app answers `remotetv://` URLs (`open -g "remotetv://…"`): `show`, `hide`,
   `press/<button>/…`, `skip/<s>`, `sleep`, `wake`, `pairing`, and the debug
   `snapshot?path=/abs/file.png[&controls=1][&appearance=dark|light|system]` (window content
@@ -70,6 +83,8 @@ Sources/RemoteCore/       protocol stack, no AppKit, unit-tested
   OPACK.swift             Apple's binary serialization: Writer (allocation-light), decoder
   TLV8.swift              HAP pairing TLVs (fragments >255 bytes)
   BigUInt.swift           minimal bignum + Montgomery modpow (SRP only)
+  BinaryPlist.swift       bplist00 reader/writer with UIDs; KeyedArchive (NSKeyedArchiver reader)
+  Media.swift             NowPlaying, TextSession, RTI text operations, ArchiveBuilder
   SRP.swift               SRP-6a client, 3072-bit group, SHA-512
   HAP.swift               PairSetup (M1–M6), PairVerify (M1–M4), Credentials, crypto helpers
   Connection.swift        NWConnection, framing, FrameCipher (ChaCha20-Poly1305)
@@ -80,7 +95,7 @@ Sources/RemoteCore/       protocol stack, no AppKit, unit-tested
 Sources/RemoteTV/         the app (AppKit)
   main.swift              delegate first (starts connecting), then NSApplication
   AppDelegate.swift       wiring: window, remote lifecycle/retry, pairing, keys, URLs, Launch timing
-  RemoteView.swift        fixed layout (flipped), PairingView
+  RemoteView.swift        fixed layout (flipped): NowPlayingStrip (title + scrubber), TextEntry, PairingView
   ClickPad.swift          glass clickpad: wedges/center hit testing, trackpad swipe → touch
   Controls.swift          Theme, PressView (down/up), GlassButton, SplitPill, IconButton
   MediaKeys.swift         session event tap for NX_SYSDEFINED media keys (Accessibility)
@@ -94,9 +109,16 @@ Only SRP (pairing, ~10 ms release / ~1 s debug) runs on a detached task.
 
 ## Protocol notes (Companion Link; owner's TV: AppleTV18,1, tvOS 27.2.1)
 
-Status: discovery, TCP and pair-setup M1/M2 verified live on the owner's TV
-(2026-11-20); M3–M6, pair-verify and the session verified only against the fake
-accessory in `PairingTests` until the first real pairing. Update this line when it lands.
+Status (2026-11-20): pairing, pair-verify (~37 ms connect), buttons, skip, seek, now
+playing and ToggleCaptions verified live. Text input implemented per protocol and
+unit-tested, not yet seen working live (see below).
+
+**Ground truth for message names**: macOS ships the iOS remote's framework,
+`TVRemoteCore` (and Rapport, the Companion client), in the dyld shared cache. `strings -a`
+over `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e.*`
+and grep near `TVRCSessionStart` lists every TVRC request/event/key (that's how
+`ToggleCaptions` and `FetchCurrentNowPlayingInfoEvent` were found); near `_skpS` for the
+Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
 
 
 - Discovery: Bonjour `_companion-link._tcp`; TXT `rpMd` = model ("AppleTV…"). Macs and
@@ -119,6 +141,35 @@ accessory in `PairingTests` until the first real pairing. Update this line when 
   sent as "up" only. Skip: `_mcc {_mcc: 7, _skpS: ±seconds as double}` (negative integers
   aren't safe in OPACK). Touch: event `_hidT {_ns, _tFg: 1, _cx, _cy (0…1000), _tPh}`.
 - Volume works only when the TV controls the TV/receiver over HDMI-CEC.
+- Errors come back as `_em` (text) and/or `_ec` + `_ed` (code, domain; `RPErrorDomain`
+  -6714 = not handled, e.g. `_mcc` GetVolume while some apps play).
+- Now playing: register `NowPlayingInfo` in `_interest`, send `FetchCurrentNowPlayingInfoEvent`
+  (empty reply); the TV pushes `NowPlayingInfo {NowPlayingInfoKey: keyed archive}` now and on
+  every state change (play/pause/seek/new item), not continuously. Archive =
+  `TVRCNowPlayingInfo` {playbackRate, playbackState (1 playing), captionsEnabled,
+  hasValidCaptionOptions, imageData, metadata: TVRCNowPlayingMetadata {title, episodeTitle,
+  duration, timeOffset (position at timestamp), timestamp (s since 2001, TV clock), bundleID,
+  …}}. Position is extrapolated locally (`NowPlaying.position`). Seeking = `_mcc` skip by
+  the difference (no absolute seek in Companion); the TV pushes the new position.
+- Captions: request `ToggleCaptions` (TVRC, empty content). State comes from now playing.
+- Text input (RTI): `_tiStart` request (reply `_c._tiD` = archive with `$top.sessionUUID`
+  and `$top.documentState.docSt.contextBeforeInput` if a field is focused), events
+  `_tiStarted {_tiD}` / `_tiStopped`, edit = event `_tiC {_tiV: 1, _tiD:
+  RTITextOperations archive ($archiver RTIKeyedArchiver; targetSessionUUID NSUUID,
+  keyboardOutput TIKeyboardOutput{insertionText}, textToAssert)}`. The app replaces the
+  whole text (`textToAssert`) on every edit. The TV only pushes events to clients whose
+  `_systemInfo._i` is non-null (pyatv 0.17 broke focus events by dropping it). Opening
+  Search with `_launchApp com.apple.TVSearch` did NOT produce a session blind (focus
+  state unknown without seeing the TV): first thing to verify with the owner.
+- Mute: not in Companion. The iOS remote mutes through HomeKit (TVRemoteCore: "Sending
+  mute key to service", HMCharacteristicTypeMute). Known alternative: MRP `SendHIDEvent`
+  consumer page 12 usage 0xE2 over the AirPlay 2 tunnel (pyatv issue #2555), which
+  itsytv opens with the *Companion* credentials (no second PIN). That tunnel is the next
+  big piece if mute (or MRP-only features) is wanted: AirPlay pair-verify over HTTP,
+  HAP-encrypted RTSP, SETUP data stream, encrypted data-stream frames with binary plists
+  wrapping protobuf MRP messages. `_mcc` SetVolume (6, `_vol` 0…1) exists and GetVolume
+  answered 0.5 with nothing playing; untested what it does to a CEC soundbar (don't
+  experiment while the owner is away: it could jump the volume).
 
 ## Performance notes (M4 Max, macOS 27.2.1, 2026-11-20)
 
@@ -136,10 +187,7 @@ accessory in `PairingTests` until the first real pairing. Update this line when 
 
 ## Open work / ideas (owner hasn't asked for these; propose before big ones)
 
-- Text input: when the TV shows a keyboard (`_tiStarted`), show a field and send `_tiC`
-  with an RTI NSKeyedArchiver payload (needs `_tiStart`; pyatv's plist_payloads documents
-  the shape).
-- Now playing (title, artwork, progress) needs MRP over the AirPlay 2 tunnel (HAP over
-  AirPlay pairing + protobufs). Large; only if asked.
-- Captions / mute buttons from the iOS remote: no Companion command known.
+- Artwork: `NowPlaying.artwork` (imageData) is parsed but not shown; it was null for the
+  one item seen.
+- Mute: see Protocol notes (MRP over AirPlay, or SetVolume(0) if it proves safe).
 - App launcher (`FetchLaunchableApplicationsEvent`, `_launchApp`): `Remote.launch` exists.

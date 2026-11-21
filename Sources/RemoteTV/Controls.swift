@@ -38,8 +38,10 @@ class PressView: NSView {
 final class GlassButton: PressView {
     private let glass = NSGlassEffectView()
     private let icon = NSImageView()
+    private let pointSize: CGFloat
 
     init(symbol: String, label: String, diameter: CGFloat = Theme.buttonDiameter, pointSize: CGFloat = Theme.symbolSize) {
+        self.pointSize = pointSize
         super.init(frame: NSRect(x: 0, y: 0, width: diameter, height: diameter))
         glass.frame = bounds
         glass.autoresizingMask = [.width, .height]
@@ -62,8 +64,9 @@ final class GlassButton: PressView {
 
     var symbol: String = "" {
         didSet {
+            guard symbol != oldValue else { return }
             icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: accessibilityLabel())?
-                .withSymbolConfiguration(.init(pointSize: Theme.symbolSize, weight: .medium))
+                .withSymbolConfiguration(.init(pointSize: pointSize, weight: .medium))
         }
     }
 
