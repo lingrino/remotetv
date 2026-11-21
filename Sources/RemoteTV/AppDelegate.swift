@@ -105,9 +105,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func applicationDidBecomeActive(_ note: Notification) {
         if window != nil && !window.isVisible { show() }
-        if !mediaKeys.enable() && !MediaKeys.trusted {
-            AppDelegate.log.notice("media keys need the Accessibility grant")
-        }
+        let tap = mediaKeys.enable()
+        AppDelegate.log.info("active; accessibility \(MediaKeys.trusted ? "granted" : "not granted", privacy: .public), media-key tap \(tap ? "on" : "off", privacy: .public)")
         reconnectIfNeeded()
     }
 

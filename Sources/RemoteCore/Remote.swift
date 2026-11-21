@@ -90,7 +90,13 @@ public final class Remote {
 
     public let device: Device
     public private(set) var credentials: Credentials?
-    public private(set) var status: Status = .idle { didSet { if status != oldValue { onStatus?(status) } } }
+    public private(set) var status: Status = .idle {
+        didSet {
+            guard status != oldValue else { return }
+            Remote.log.info("\(self.device.name, privacy: .public): \(String(describing: self.status), privacy: .public)")
+            onStatus?(status)
+        }
+    }
     public private(set) var power: PowerState = .unknown { didSet { if power != oldValue { onPower?(power) } } }
     public private(set) var controls: MediaControls = []
 
