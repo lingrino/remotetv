@@ -246,6 +246,9 @@ public final class MediaRemote {
             if let sc = s.message(2) { p.commands = sc.messages(1) }
             if let q = s.message(3) {
                 if let onTrace {
+                    for item in q.messages(2) where item.has(3) {
+                        onTrace("  artwork \(item.bytes(3)?.count ?? 0) B \(item.int(13) ?? 0)x\(item.int(14) ?? 0) \(item.message(2)?.string(31) ?? "")")
+                    }
                     for item in q.messages(2) {
                         let legible = item.messages(5).flatMap { $0.messages(3) }.filter { $0.int(1) == 1 }.count
                         onTrace("  setState client=\(client) player=\(player) state=\(s.int(6).map(String.init) ?? "-") item=\(item.string(1)?.prefix(40) ?? "?") title=\(item.message(2)?.string(1) ?? "-") legible=\(legible) current=\(item.messages(6).map { $0.int(1) ?? -1 })")
