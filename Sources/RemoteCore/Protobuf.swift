@@ -121,7 +121,19 @@ struct ProtoMessage {
 
     func bytes(_ f: Int) -> [UInt8]? { if case .bytes(let b)? = last(f) { Array(b) } else { nil } }
     func string(_ f: Int) -> String? { if case .bytes(let b)? = last(f) { String(decoding: b, as: UTF8.self) } else { nil } }
-    func message(_ f: Int) -> ProtoMessage? { if case .bytes(let b)? = last(f) { try? ProtoMessage(b) } else { nil } }
+    /// A singular embedded message. Several occurrences merge, as protobuf specifies:
+    /// parse their concatenation (later scalar values win, nested messages merge).
+    func message(_ f: Int) -> ProtoMessage? {
+        var parts: [ArraySlice<UInt8>] = []
+        for (n, v) in fields where n == f { if case .bytes(let b) = v { parts.append(b) } }
+        if parts.count <= 1 { return parts.first.flatMap { try? ProtoMessage($0) } }
+        return try? ProtoMessage(Array(parts.joined()))
+    }
+
+    /// Every occurrence of a length-delimited field, raw (repeated sub-messages as bytes).
+    func datas(_ f: Int) -> [[UInt8]] {
+        fields.compactMap { if $0.0 == f, case .bytes(let b) = $0.1 { Array(b) } else { nil } }
+    }
 
     func messages(_ f: Int) -> [ProtoMessage] {
         fields.compactMap { if $0.0 == f, case .bytes(let b) = $0.1 { try? ProtoMessage(b) } else { nil } }

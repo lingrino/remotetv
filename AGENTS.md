@@ -22,6 +22,13 @@ This file is the agent guide (Claude Code reads it when there is no CLAUDE.md; d
   launcher). Launching it again must show it immediately.
 - Local git repo only for now (no remote, no CI, no releases).
 
+Round 3 (2026-11-21): text bar redesigned (glass capsule), ⌘C/⌘X/⌘Z, typing sent as
+delete/insert edits (YouTube doesn't report its field's text, so replace wiped it). The
+owner accepted building the AirPlay/MRP tunnel "only if very reliable and unnoticeable":
+it starts after every Companion session, never blocks the remote, retries quietly
+(2 s → 60 s backoff), and is the now-playing source when up. Mute = the speaker in the
+middle of the volume pill (dim when the tunnel is down).
+
 Round 2 (2026-11-20, after first use): "very nice". Power button moved from the title bar
 to the bottom row (it looked out of place there). Wanted: mute and subtitles like the iOS
 remote, typing into TV text fields, a native scrubber; now playing worth exploring if it's
@@ -48,7 +55,7 @@ Privacy grants are keyed on bundle id + team, so they survive every rebuild.
 ### Live testing
 
 - `tvctl scan | pair <tv> | status | press [tv:] down select … | skip 10 | seek 1234 | np |
-  captions | text <s> | sleep | wake` shares the app's pairing store; use it to test protocol
+  captions | text <s> | sleep | wake | airplay | mrp [s] | mute | mseek <s> | subs` shares the app's pairing store; use it to test protocol
   changes without the UI. `tvctl status` prints the connect timings; `tvctl -v …` traces
   every message. Exploration: `tvctl raw <_i> key=value…` (prints the reply) and
   `tvctl listen <s> <event>… +<request>… !<button>…` (TVCTL_DUMP=dir writes every binary
@@ -85,6 +92,9 @@ Sources/RemoteCore/       protocol stack, no AppKit, unit-tested
   BigUInt.swift           minimal bignum + Montgomery modpow (SRP only)
   BinaryPlist.swift       bplist00 reader/writer with UIDs; KeyedArchive (NSKeyedArchiver reader)
   Media.swift             NowPlaying, TextSession, RTI text operations, ArchiveBuilder
+  AirPlay.swift           HAPCipher, HAPStream, HTTPMessage, AirPlayTunnel (control/events/data)
+  Protobuf.swift          hand-rolled protobuf writer/reader
+  MRP.swift               MediaRemote: MRP handshake, player state, seek, subtitles, mute
   SRP.swift               SRP-6a client, 3072-bit group, SHA-512
   HAP.swift               PairSetup (M1–M6), PairVerify (M1–M4), Credentials, crypto helpers
   Connection.swift        NWConnection, framing, FrameCipher (ChaCha20-Poly1305)
@@ -161,15 +171,52 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
   `_systemInfo._i` is non-null (pyatv 0.17 broke focus events by dropping it). Opening
   Search with `_launchApp com.apple.TVSearch` did NOT produce a session blind (focus
   state unknown without seeing the TV): first thing to verify with the owner.
-- Mute: not in Companion. The iOS remote mutes through HomeKit (TVRemoteCore: "Sending
-  mute key to service", HMCharacteristicTypeMute). Known alternative: MRP `SendHIDEvent`
-  consumer page 12 usage 0xE2 over the AirPlay 2 tunnel (pyatv issue #2555), which
-  itsytv opens with the *Companion* credentials (no second PIN). That tunnel is the next
-  big piece if mute (or MRP-only features) is wanted: AirPlay pair-verify over HTTP,
-  HAP-encrypted RTSP, SETUP data stream, encrypted data-stream frames with binary plists
-  wrapping protobuf MRP messages. `_mcc` SetVolume (6, `_vol` 0…1) exists and GetVolume
-  answered 0.5 with nothing playing; untested what it does to a CEC soundbar (don't
-  experiment while the owner is away: it could jump the volume).
+- AirPlay remote-control tunnel (`AirPlay.swift`, verified 2026-11-20, ready in ~55–70 ms):
+  Bonjour `_airplay._tcp` (same instance name as the Companion service), IPv4.
+  `POST /pair-verify` HTTP/1.1 (headers User-Agent AirPlay/320.20, X-Apple-HKP 3,
+  octet-stream) ×2 with the **Companion credentials** — accepted, no second pairing.
+  Then HAP framing on the control connection (Control-Salt, Control-Write/Read-Encryption-Key):
+  ≤1024-byte frames, `len(2 LE) | ciphertext | tag`, AAD = len, nonce = 4 zero bytes +
+  counter LE. RTSP/1.0 SETUP (bplist {isRemoteControlOnly: true, …}) → eventPort; event
+  channel keys Events-Salt with *Read* as our send key; RECORD; SETUP {streams: [{type 130,
+  controlType 2, seed, …}]} → dataPort; data keys "DataStream-Salt<seed>",
+  DataStream-Output/Input-Encryption-Key. Data frames: 32-byte BE header (size, "sync"/"rply"
+  + 8 zeros, "comm", seqno, pad) + bplist {params: {data: varint-length-prefixed MRP
+  protobufs}}; answer every "sync" with a "rply" of the same seqno. `POST /feedback` every
+  2 s. Coexists with the Companion connection (no kick-off).
+- MRP over the tunnel (`MRP.swift`, `MediaRemote`; ready ~70 ms after the tunnel):
+  ProtocolMessage {type 1, identifier 2, errorCode 4 (=0), uniqueIdentifier 85, payload in
+  an extension field per type}. Handshake: DEVICE_INFO (15/ext 20, as the iOS remote:
+  com.apple.TVRemote 344.28, lastSupportedMessageType 108, deviceClass iPhone) → wait for
+  the TV's DEVICE_INFO → SET_CONNECTION_STATE Connected, CLIENT_UPDATES_CONFIG (all true,
+  **nowPlayingUpdates must be true**), GET_KEYBOARD_SESSION, PLAYBACK_QUEUE_REQUEST
+  (location 0, length 1, includeMetadata, includeLanguageOptions). The TV then pushes
+  SetNowPlayingClient (46/50), SetNowPlayingPlayer (47/51), SetState (4/9: playbackState,
+  supportedCommands, playbackQueue → ContentItem {metadata, availableLanguageOptions 5,
+  currentLanguageOptions 6}), UpdateContentItem (56/60, metadata deltas: protobuf merge =
+  byte concatenation, which `ProtoMessage.message` honors), Remove{Client,Player}.
+  Now playing = active client → its active player (else MediaRemote-DefaultPlayer) →
+  items[location].metadata {title 1, duration 14, elapsedTime 35, playbackRate 39,
+  isAlwaysLive 37, elapsedTimeTimestamp 74}. Every app reports here (Prime, YouTube…),
+  unlike Companion's NowPlayingInfo (Apple-TV-app-centric, flaky: owner saw it drop).
+  Commands: SeekToPlaybackPosition (SendCommand 1/6 {command 45, options {playbackPosition
+  9}}); subtitles = Enable/DisableLanguageOption (53/54, options.languageOption 27 = the
+  LanguageOption protobuf bytes as received; type 1 = legible, 0 = audible) — only apps
+  using AVKit publish options (TV app: yes; Prime's own player: none, so the button falls
+  back to Companion ToggleCaptions there); mute = SendHIDEvent (8/13) consumer page 12,
+  usage 0xE2, down+up, then an empty GENERIC (42) flush. The 60-byte HID event template is
+  in `MediaRemote.hidEvent` (test pins pyatv's known-good bytes). Mute state isn't
+  reported for HDMI-CEC audio, so the button doesn't show muted/unmuted.
+- Mute/volume background: the iOS remote mutes through HomeKit (TVRemoteCore: "Sending
+  mute key to service", HMCharacteristicTypeMute); HomeKit needs a Mac Catalyst app with
+  the HomeKit entitlement — not an option for this AppKit app. `_mcc` SetVolume (6, `_vol`
+  0…1) exists and GetVolume answered 0.5 with nothing playing; untested on a CEC soundbar
+  (could jump the volume; don't experiment while the owner is away).
+- Info.plist NSBonjourServices must list every service type resolved (`_airplay._tcp`
+  too): an undeclared type fails with NWError -65555 NoAuth in the app (tvctl, a CLI, isn't
+  subject to it, so it hides the problem).
+- Data-stream bug to not repeat: the frame type is at bytes 4–11 (after the size); a sync
+  frame that isn't answered with a "rply" makes the TV stop sending.
 
 ## Performance notes (M4 Max, macOS 27.2.1, 2026-11-20)
 
@@ -189,5 +236,4 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
 
 - Artwork: `NowPlaying.artwork` (imageData) is parsed but not shown; it was null for the
   one item seen.
-- Mute: see Protocol notes (MRP over AirPlay, or SetVolume(0) if it proves safe).
 - App launcher (`FetchLaunchableApplicationsEvent`, `_launchApp`): `Remote.launch` exists.

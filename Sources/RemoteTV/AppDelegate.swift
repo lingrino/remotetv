@@ -262,6 +262,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             guard let self, let r, r === self.remote else { return }
             self.updateHeader()
         }
+        r.onMediaReady = { [weak self, weak r] ok in
+            guard let self, let r, r === self.remote, self.window != nil else { return }
+            self.view.volume.muteAvailable = ok
+        }
         r.onTextSession = { [weak self, weak r] s in
             guard let self, let r, r === self.remote else { return }
             self.textSessionChanged(s)
@@ -338,6 +342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         view.strip.show(status == nil ? r.nowPlaying : nil, status: status)
         view.setPower(asleep: r.power == .asleep)
+        view.volume.muteAvailable = r.muteAvailable
         let np = r.nowPlaying
         view.setCaptions(available: np?.hasCaptions ?? false, on: np?.captionsEnabled ?? false)
         updateTicker()

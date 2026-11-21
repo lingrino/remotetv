@@ -234,6 +234,8 @@ public final class AirPlayTunnel {
     public var onState: ((State) -> Void)?
     /// One serialized MRP ProtocolMessage.
     public var onMessage: (([UInt8]) -> Void)?
+    /// Frame-level events, for debugging (`tvctl -v mrp`).
+    public var onTrace: ((String) -> Void)?
 
     private static let log = Logger(subsystem: "com.lingrino.remotetv", category: "airplay")
     private var control: HAPStream?
@@ -292,6 +294,7 @@ public final class AirPlayTunnel {
         payload += message
         let plist = Plist.dict([("params", .dict([("data", .data(payload))]))]).encode()
         data.send(AirPlayTunnel.frame(type: "sync", command: "comm", seqno: sendSeqno, payload: plist))
+        onTrace?("→ data frame \(plist.count + 32) B (message \(message.count) B)")
     }
 
     private func teardown() {
@@ -327,6 +330,7 @@ public final class AirPlayTunnel {
 
     private func controlData(_ bytes: [UInt8]) {
         controlBuffer += bytes
+        onTrace?("← control \(String(decoding: bytes.prefix(40), as: UTF8.self).replacingOccurrences(of: "\r\n", with: " | "))")
         do throws(ProtocolError) {
             while let msg = try HTTPMessage.take(from: &controlBuffer) {
                 guard !waiting.isEmpty else { continue }
@@ -412,6 +416,7 @@ public final class AirPlayTunnel {
     /// The TV's requests on the event channel get a plain 200.
     private func eventData(_ bytes: [UInt8]) {
         eventBuffer += bytes
+        onTrace?("← event bytes \(bytes.count)")
         do throws(ProtocolError) {
             while let req = try HTTPMessage.take(from: &eventBuffer) {
                 var h: [(String, String)] = [("Audio-Latency", "0")]
@@ -486,12 +491,14 @@ public final class AirPlayTunnel {
             let size = Int(dataBuffer[0]) << 24 | Int(dataBuffer[1]) << 16 | Int(dataBuffer[2]) << 8 | Int(dataBuffer[3])
             guard size >= 32, size < 1 << 24 else { return fail(.malformed("data stream frame size")) }
             guard dataBuffer.count >= size else { break }
-            let isSync = dataBuffer.starts(with: Array("sync".utf8))
+            let isSync = dataBuffer[4..<8].elementsEqual("sync".utf8)   // type follows the 4-byte size
             var seqno: UInt64 = 0
             for i in 20..<28 { seqno = seqno << 8 | UInt64(dataBuffer[i]) }
             let payload = Array(dataBuffer[32..<size])
             dataBuffer.removeFirst(size)
+            onTrace?("← data frame \(String(decoding: dataBuffer.isEmpty ? [] : [], as: UTF8.self))\(isSync ? "sync" : "other") \(size) B")
             if isSync { data?.send(AirPlayTunnel.frame(type: "rply", command: nil, seqno: seqno, payload: [])) }
+            if !payload.isEmpty, onTrace != nil { onTrace?("  payload \((try? Plist.decode(payload)).map { "\($0)" }?.prefix(300) ?? "not a plist")") }
             guard !payload.isEmpty, let p = try? Plist.decode(payload), let blob = p["params"]?["data"]?.data else { continue }
             var i = 0
             while i < blob.count {

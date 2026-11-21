@@ -225,6 +225,36 @@ MainActor.assumeIsolated {
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { exit(0) }
         withExtendedLifetime(t) { dispatchMain() }
 
+    case "mrp", "mute", "mseek", "subs":
+        // MRP over the AirPlay tunnel: `mrp [seconds]` prints now playing and message types;
+        // `mute` toggles mute; `mseek <s>` seeks to an absolute position.
+        let store = CredentialStore()
+        guard let name = tv ?? store.last, let creds = store.credentials(for: name) else { die("not paired") }
+        let m = MediaRemote(device: Device(name: name), credentials: creds)
+        let start = ContinuousClock.now
+        if Trace.on { m.onTrace = { print("  \($0)") }; m.tunnel.onTrace = { print("  \($0)") } }
+        m.onTunnel = { s in
+            print("\(stamp(ContinuousClock.now - start)) tunnel: \(s)")
+            if case .failed = s { exit(1) }
+        }
+        m.onNowPlaying = { np in
+            guard let np else { print("\(stamp(ContinuousClock.now - start)) nothing playing"); return }
+            print("\(stamp(ContinuousClock.now - start)) \(np.title ?? "?")\(np.subtitle.map { " — \($0)" } ?? "")  \(Int(np.position()))s / \(np.duration.map { "\(Int($0))s" } ?? "live")  rate \(np.rate) state \(np.state)  seek \(m.supports(45))  subtitles \(np.hasCaptions ? (np.captionsEnabled ? "on" : "off") : "none")")
+        }
+        let arg = args.first.flatMap(Double.init)
+        m.onReady = { ok in
+            print("\(stamp(ContinuousClock.now - start)) ready: \(ok)")
+            guard ok else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                if cmd == "mute" { print("mute"); m.toggleMute() }
+                if cmd == "subs" { print("subtitles"); m.toggleSubtitles() }
+                if cmd == "mseek", let to = arg { print("seek \(to)"); m.seek(to: to) }
+            }
+        }
+        m.start()
+        DispatchQueue.main.asyncAfter(deadline: .now() + (cmd == "mrp" ? (arg ?? 4) : 3)) { exit(0) }
+        withExtendedLifetime(m) { dispatchMain() }
+
     case "sleep", "wake":
         let r = remote(args.first ?? tv)
         session(r) { cmd == "sleep" ? r.sleep() : r.wake() }

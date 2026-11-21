@@ -234,6 +234,7 @@ public final class Remote {
     }
 
     private func teardown() {
+        stopMedia()
         timeout?.cancel()
         timeout = nil
         conn?.onEvent = nil
@@ -382,6 +383,7 @@ public final class Remote {
         request("FetchCurrentNowPlayingInfoEvent", count: 0) { _ in }
         status = .connected
         onTiming?("session", ContinuousClock.now - started)
+        startMedia()
         let pending = queued
         queued.removeAll()
         for f in pending { f() }
@@ -402,11 +404,8 @@ public final class Remote {
                     onControls?(controls)
                 }
             case "NowPlayingInfo":
-                let np = content?["NowPlayingInfoKey"]?.data.flatMap(NowPlaying.init(archive:))
-                if np != nowPlaying {
-                    nowPlaying = np
-                    onNowPlaying?(np)
-                }
+                companionPlaying = content?["NowPlayingInfoKey"]?.data.flatMap(NowPlaying.init(archive:))
+                publishNowPlaying()
             case "_tiStarted":
                 setTextSession(content?["_tiD"]?.data.flatMap(TextSession.init(archive:)))
             case "_tiStopped":
@@ -541,6 +540,10 @@ public final class Remote {
     /// Jumps to `seconds` into the playing item (as a relative skip from the current
     /// extrapolated position; Companion has no absolute seek).
     public func seek(to seconds: Double) {
+        if let m = media, m.isReady, m.supports(45) {
+            m.seek(to: seconds)
+            return
+        }
         guard let np = nowPlaying else { return }
         let delta = seconds - np.position()
         guard abs(delta) >= 0.5 else { return }
@@ -549,18 +552,110 @@ public final class Remote {
         var moved = np
         moved.elapsed = max(0, seconds)
         moved.timestamp = Date().timeIntervalSinceReferenceDate
-        nowPlaying = moved
-        onNowPlaying?(moved)
+        companionPlaying = moved
+        publishNowPlaying()
+    }
+
+    /// Mute toggle (HID Mute key over MRP); needs the AirPlay tunnel (`muteAvailable`).
+    public func toggleMute() {
+        media?.toggleMute()
+    }
+
+    public var muteAvailable: Bool { media?.isReady == true }
+
+    // MARK: - MRP (AirPlay tunnel)
+
+    /// Started with every session; a failure never affects the remote (buttons, text,
+    /// Companion now playing keep working) and is retried quietly with backoff.
+    private var media: MediaRemote?
+    private var mediaRetry: DispatchWorkItem?
+    private var mediaFailures = 0
+    private var companionPlaying: NowPlaying?
+    /// MRP ready / not (mute availability, now-playing source).
+    public var onMediaReady: ((Bool) -> Void)?
+
+    private func startMedia() {
+        guard media == nil, let credentials else { return }
+        let m = MediaRemote(device: device, credentials: credentials, name: clientName)
+        media = m
+        m.onReady = { [weak self, weak m] ok in
+            guard let self, let m, m === self.media else { return }
+            if ok { self.mediaFailures = 0 }
+            Remote.log.info("\(self.device.name, privacy: .public): MRP \(ok ? "ready" : "down", privacy: .public)")
+            self.onMediaReady?(ok)
+            self.publishNowPlaying()
+        }
+        m.onNowPlaying = { [weak self, weak m] _ in
+            guard let self, let m, m === self.media else { return }
+            self.publishNowPlaying()
+        }
+        m.onTunnel = { [weak self, weak m] s in
+            guard let self, let m, m === self.media, case .failed(let e) = s else { return }
+            Remote.log.notice("AirPlay tunnel: \(e, privacy: .public)")
+            self.scheduleMediaRetry()
+        }
+        m.start()
+    }
+
+    private func scheduleMediaRetry() {
+        mediaRetry?.cancel()
+        let delays: [Double] = [2, 5, 15, 30, 60]
+        let delay = delays[min(mediaFailures, delays.count - 1)]
+        mediaFailures += 1
+        let item = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, case .session = self.phase, let m = self.media else { return }
+                m.start()
+            }
+        }
+        mediaRetry = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func stopMedia() {
+        mediaRetry?.cancel()
+        mediaRetry = nil
+        let had = media?.isReady == true
+        media?.onReady = nil
+        media?.onNowPlaying = nil
+        media?.onTunnel = nil
+        media?.stop()
+        media = nil
+        if had { onMediaReady?(false) }
+    }
+
+    /// MRP's now playing when the tunnel is up (every app reports to it), else Companion's;
+    /// subtitle availability/state always from Companion (MRP doesn't carry it simply).
+    private func publishNowPlaying() {
+        var np = media?.isReady == true ? media?.nowPlaying : companionPlaying
+        if var n = np, let c = companionPlaying {
+            if !n.captionsFromMRP {
+                n.captionsEnabled = c.captionsEnabled
+                n.hasCaptions = c.hasCaptions
+            }
+            n.bundleID = n.bundleID ?? c.bundleID
+            np = n
+        }
+        guard np != nowPlaying else { return }
+        nowPlaying = np
+        onNowPlaying?(np)
     }
 
     /// Asks for a fresh now-playing snapshot (arrives via `onNowPlaying`).
     public func refreshNowPlaying() {
         guard case .session = phase else { return }
+        media?.refresh()
         request("FetchCurrentNowPlayingInfoEvent", count: 0) { _ in }
     }
 
-    /// Subtitles on/off for the playing item (when it has caption tracks).
+    /// Subtitles on/off for the playing item (when it has caption tracks): MRP language
+    /// options when the tunnel is up (reliable, state comes back), else Companion's
+    /// ToggleCaptions.
     public func toggleCaptions() {
+        if let m = media, m.isReady, nowPlaying?.captionsFromMRP == true {
+            m.toggleSubtitles()
+            return
+        }
         whenConnected { [weak self] in
             self?.request("ToggleCaptions", count: 0) { _ in
                 // The TV doesn't always push a new snapshot after a toggle: ask.

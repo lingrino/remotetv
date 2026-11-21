@@ -21,6 +21,8 @@ public struct NowPlaying: Sendable, Equatable {
     public var hasCaptions: Bool
     public var bundleID: String?
     public var artwork: [UInt8]?
+    /// The subtitle fields came from MRP language options (trusted over Companion's).
+    public var captionsFromMRP = false
 
     public var isPlaying: Bool { state == 1 && rate != 0 }
 
