@@ -1,8 +1,10 @@
 # remotetv
 
-remotetv is a mac app for controlling my apple tv: a small window with the siri remote's controls that also takes the keyboard (arrows, return, delete) and the mac's volume and media keys. it talks to the apple tv directly over the local network, is focused on performance, and has zero dependencies.
+an apple tv remote as a mac app
+- supports keyboard control, including typing into text boxes and media keys
+- shows now playing info with a scrubber
+- sidebar showing artwork, up next, and an app launcher
+- also adds `tvctl`, a cli for using the remote
+- focused on performance & reliability. zero dependencies
 
-- clickpad with real holds, back, tv, play/pause, power, volume, mute, skip ±10s, subtitles
-- now playing with a scrubber, and a sidebar with artwork, up next, and the tv's apps
-- typing into the tv's text fields from the mac keyboard
-- `tvctl`, a command line that works through the running app
+<img src="docs/remote.png" alt="remotetv" width="412">
