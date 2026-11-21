@@ -20,12 +20,16 @@ This file is the agent guide (Claude Code reads it when there is no CLAUDE.md; d
 - Single user, one Apple TV most of the time (a couple more when traveling). No config.
 - A window you can drag around (not a menu-bar extra), launched from Fred (the owner's
   launcher). Launching it again must show it immediately.
-- Local git repo at first, then public on GitHub (lingrino/remotetv), released through
-  the owner's Homebrew tap like fred and peep (see CI and releases).
+- Local git repo at first, then GitHub (lingrino/remotetv), released through the
+  owner's Homebrew tap like fred and peep (see CI and releases).
 
-Round 7 (2026-11-21): published: GitHub repo (Terraform in lingrino/infra), CI and
-releases copied from autotouch/fred, cask in lingrino/homebrew-tap, installed on the
-owner's Macs by their dotfiles. No AI attribution in commits or PRs, ever.
+Round 7 (2026-11-21): on GitHub, **private until the owner makes it public** (they
+asked to stop before that step). Repo, ruleset and secrets are Terraform in lingrino/infra
+(#3043, #3044); CI and releases copied from autotouch/fred. Still to do, in order: the
+infra PR that makes it public (visibility and the selected-actions list, like autotouch's
+#3041), then secret scanning in its own PR (#3042's shape); the next merge after that
+publishes `Casks/remotetv.rb` in lingrino/homebrew-tap; then lingrino/dotfiles#16 (draft)
+installs it on the personal Mac and the mini. No AI attribution in commits or PRs, ever.
 
 Round 6 (2026-11-20): an independent full review (another model, all files) before going
 public on GitHub; its findings were fixed (see Security and Reliability). Next: publish.
@@ -73,6 +77,8 @@ Privacy grants are keyed on bundle id + team, so they survive every rebuild.
 
 ### CI and releases (`.github/workflows`, same as fred/peep/autotouch)
 
+- Changes land through PRs only: branch, `make check` (plus live checks for anything the
+  TV sees), PR, required checks, squash merge. Every merge to main is a release.
 - `validate`, on every PR. The main ruleset requires a PR (no direct pushes, no force
   pushes) and its `lint`, `test` and `scripts` jobs: `make lint`; `make test` plus a
   release dry run (ad-hoc signed) and `brew style` on the generated cask; shellcheck and
