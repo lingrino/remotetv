@@ -102,6 +102,8 @@ public final class Remote {
     }
     public private(set) var power: PowerState = .unknown { didSet { if power != oldValue { onPower?(power) } } }
     public private(set) var controls: MediaControls = []
+    /// False until the TV has said which controls work (then dimming applies).
+    public private(set) var controlsKnown = false
     /// What's playing (nil: nothing, or not known yet).
     public private(set) var nowPlaying: NowPlaying?
     /// The TV's focused text field, if any.
@@ -148,9 +150,19 @@ public final class Remote {
     private var sid: UInt64 = 0
     private var started = ContinuousClock.now
 
+    // Liveness (see "Reliability" below).
+    private var awaiting: [Int: ContinuousClock.Instant] = [:]
+    private var deafCheck: DispatchWorkItem?
+    private var keepalive: Timer?
+    private var lastAnswer = ContinuousClock.now
+    private var lastKnock = ContinuousClock.now - .seconds(60)
+    /// Where the TV was last reached; knocked on to wake it when it can't be found.
+    public private(set) var lastHost: NWEndpoint.Host?
+
     public init(device: Device, credentials: Credentials?) {
         self.device = device
         self.credentials = credentials
+        if let h = UserDefaults.standard.string(forKey: "host.\(device.name)") { lastHost = NWEndpoint.Host(h) }
     }
 
     public var isPaired: Bool { credentials != nil }
@@ -240,6 +252,11 @@ public final class Remote {
         stopMedia()
         timeout?.cancel()
         timeout = nil
+        awaiting.removeAll()
+        deafCheck?.cancel()
+        deafCheck = nil
+        keepalive?.invalidate()
+        keepalive = nil
         conn?.onEvent = nil
         conn?.cancel()
         conn = nil
@@ -251,6 +268,10 @@ public final class Remote {
         Remote.log.error("\(self.device.name, privacy: .public): \(e.description, privacy: .public)")
         queued.removeAll()
         teardown()
+        switch e {
+        case .timeout, .connection: knock()
+        default: break
+        }
         status = .failed(e.description)
     }
 
@@ -393,6 +414,17 @@ public final class Remote {
         request("FetchCurrentNowPlayingInfoEvent", count: 0) { _ in }
         status = .connected
         onTiming?("session", ContinuousClock.now - started)
+        lastAnswer = .now
+        if let h = conn?.remoteHost {
+            lastHost = h
+            UserDefaults.standard.set("\(h)", forKey: "host.\(device.name)")
+        }
+        let k = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.conn?.send(.noOp, []) }
+        }
+        k.tolerance = 5
+        RunLoop.main.add(k, forMode: .common)
+        keepalive = k
         startMedia()
         let pending = queued
         queued.removeAll()
@@ -409,8 +441,9 @@ public final class Remote {
             case "SystemStatus", "TVSystemStatus":
                 if let s = content?["state"]?.int { systemStatus(s) }
             case "_iMC":
-                if let f = content?["_mcF"]?.int, Int(f) != controls.rawValue {
+                if let f = content?["_mcF"]?.int, Int(f) != controls.rawValue || !controlsKnown {
                     controls = MediaControls(rawValue: Int(f))
+                    controlsKnown = true
                     onControls?(controls)
                 }
             case "NowPlayingInfo":
@@ -425,6 +458,8 @@ public final class Remote {
             }
         case 3:   // response
             guard let x = msg["_x"]?.int else { return }
+            awaiting.removeValue(forKey: Int(x))
+            lastAnswer = .now
             let handler = replies.removeValue(forKey: Int(x))
             // Errors: `_em` (message) and/or `_ec`/`_ed` (code, domain; -6714 = not handled).
             let error: String? = msg["_em"]?.string ?? msg["_ec"]?.int.map { code in
@@ -458,7 +493,7 @@ public final class Remote {
 
     /// Writes `{_i, _t, _c: {count pairs}, _x}` and sends it encrypted.
     private func send(_ identifier: String, type: Int, count: Int, _ content: (inout OPACK.Writer) -> Void,
-                      reply: ((OPACK.Value) -> Void)?) {
+                      reply: ((OPACK.Value) -> Void)?, then done: (@MainActor () -> Void)? = nil) {
         guard let conn else { return }
         var w = OPACK.Writer(capacity: 96)
         w.dict(4)
@@ -469,8 +504,9 @@ public final class Remote {
         xid = (xid + 1) & 0x7FFF_FFFF
         w.string("_x"); w.int(x)
         if let reply { replies[x] = reply }
+        if type == 2 && (identifier == "_hidC" || identifier == "FetchMediaControlStatus") { track(x) }
         if let onTrace { onTrace("→ \((try? OPACK.decode(w.bytes)).map { "\($0)" } ?? "?")") }
-        conn.send(.encryptedOPACK, w.bytes)
+        if let done { conn.send(.encryptedOPACK, w.bytes, then: done) } else { conn.send(.encryptedOPACK, w.bytes) }
     }
 
     private func request(_ id: String, count: Int, _ content: (inout OPACK.Writer) -> Void,
@@ -496,6 +532,107 @@ public final class Remote {
             let s = String(b, radix: 16, uppercase: true)
             return s.count == 1 ? "0" + s : s
         }.joined(separator: ":")
+    }
+
+    // MARK: - Reliability
+
+    /// A TV can keep the TCP connection while its remote service stops answering (seen by
+    /// other clients after hours). Presses and probes are tracked; one unanswered for 3 s
+    /// drops the session, discards queued presses (replaying them late would be worse than
+    /// losing them) and lets the owner reconnect.
+    static let deafAfter: Duration = .seconds(3)
+
+    private func track(_ x: Int) {
+        awaiting[x] = .now
+        if deafCheck == nil { scheduleDeafCheck() }
+    }
+
+    private func scheduleDeafCheck() {
+        let item = DispatchWorkItem { [weak self] in MainActor.assumeIsolated { self?.checkDeaf() } }
+        deafCheck = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: item)
+    }
+
+    private func checkDeaf() {
+        deafCheck = nil
+        guard case .session = phase, let oldest = awaiting.values.min() else {
+            awaiting.removeAll()
+            return
+        }
+        if ContinuousClock.now - oldest > Remote.deafAfter {
+            Remote.log.error("\(self.device.name, privacy: .public): stopped answering; reconnecting")
+            queued.removeAll()
+            closed(.connection("the Apple TV stopped responding"))
+            return
+        }
+        scheduleDeafCheck()
+    }
+
+    /// Checks a session that's been quiet for a while (the window came forward): a cheap
+    /// request that must be answered, so a dead session is found before the user presses.
+    /// Not connected: connects.
+    public func probe() {
+        switch phase {
+        case .session:
+            guard ContinuousClock.now - lastAnswer > .seconds(15) else { return }
+            request("FetchMediaControlStatus", count: 0, { _ in }) { [weak self] reply in
+                guard let self, let f = reply["_c"]?["MediaControlFlags"]?.int, Int(f) != self.controls.rawValue else { return }
+                self.controls = MediaControls(rawValue: Int(f))
+                self.controlsKnown = true
+                self.onControls?(self.controls)
+            }
+        case .idle:
+            if isPaired { connect() }
+        default:
+            break
+        }
+    }
+
+    /// Drops the connection and makes a new one now (network changed, Mac woke).
+    public func reconnect() {
+        guard isPaired else { return }
+        switch phase {
+        case .pairStart, .pinEntry, .pairM3, .pairM5: return   // never interrupt pairing
+        default: break
+        }
+        teardown()
+        status = .idle
+        connect()
+    }
+
+    /// Closes the session the way Apple's remote does (`_sessionStop`), then disconnects.
+    /// `done` runs once the goodbye is on the wire (or right away when not connected).
+    public func goodbye(then done: @escaping @MainActor () -> Void = {}) {
+        guard case .session = phase else {
+            disconnect()
+            return done()
+        }
+        var finished = false
+        let finish: @MainActor () -> Void = { [weak self] in
+            guard !finished else { return }
+            finished = true
+            self?.disconnect()
+            done()
+        }
+        let s = sid
+        send("_sessionStop", type: 2, count: 2, { w in
+            w.string("_srvT"); w.string("com.apple.tvremoteservices")
+            w.string("_sid"); w.uint(s)
+        }, reply: nil, then: finish)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { MainActor.assumeIsolated { finish() } }
+    }
+
+    /// Wakes a TV whose address is known but that can't be reached: a sleeping Apple TV's
+    /// Bonjour records live on in a sleep proxy, which wakes it when someone connects to
+    /// one of its ports. Brief connection attempts, at most every 10 s.
+    private func knock() {
+        guard let host = lastHost, ContinuousClock.now - lastKnock > .seconds(10) else { return }
+        lastKnock = .now
+        for port: UInt16 in [49153, 7000, 3689, 49152, 32498] {
+            let c = NWConnection(host: host, port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+            c.start(queue: .main)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { c.cancel() }
+        }
     }
 
     // MARK: - Commands
@@ -572,6 +709,13 @@ public final class Remote {
     }
 
     public var muteAvailable: Bool { media?.isReady == true }
+
+    /// Whether the scrubber can move playback: MRP absolute seek, or Companion skips (the
+    /// TV's flags; assumed yes until it has said).
+    public var canSeek: Bool {
+        if let m = media, m.isReady, m.supports(45) { return true }
+        return !controlsKnown || controls.contains(.skipForward) || controls.contains(.skipBackward)
+    }
 
     // MARK: - MRP (AirPlay tunnel)
 

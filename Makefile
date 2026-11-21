@@ -5,7 +5,8 @@
 #   make test       run unit tests (debug build, all runtime checks on)
 #   make lint       release + debug build must produce zero compiler warnings
 #   make check      lint + test: before every commit
-#   make tvctl      build the command-line client into .build/release/tvctl
+#   make tvctl      build the command-line client into .build/release/tvctl (the app bundles
+#                   it in Contents/Helpers and links it into ~/.local/bin on launch)
 
 APP        := build/RemoteTV.app
 INSTALLED  := /Applications/RemoteTV.app
@@ -19,6 +20,7 @@ signing:
 
 app: signing
 	./scripts/swift.sh build -c release --product RemoteTV
+	./scripts/swift.sh build -c release --product tvctl
 	./scripts/bundle.sh release "$(APP)"
 
 install: app

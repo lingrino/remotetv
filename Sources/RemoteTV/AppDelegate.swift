@@ -1,4 +1,5 @@
 import AppKit
+import Network
 import RemoteCore
 import os
 
@@ -11,15 +12,16 @@ import os
 /// (browsing, the media-key tap) waits until after the first frame.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
-    private var window: NSWindow!
-    private lazy var view = RemoteView()
-    private var store = CredentialStore()
-    private var remote: Remote?
+    var window: NSWindow!
+    lazy var view = RemoteView()
+    var store = CredentialStore()
+    var remote: Remote?
     private var pairer: Remote?
-    private var devices: [Device] = []
+    var devices: [Device] = []
     private var browser: Browser?
     private let mediaKeys = MediaKeys()
     private var heldKeys: [UInt16: Button] = [:]
+    private var control: ControlServer?
     private var retryCount = 0
     private var retryItem: DispatchWorkItem?
 
@@ -50,12 +52,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         Launch.mark("window")
         DispatchQueue.main.async { Launch.mark("nextTurn") }
         DispatchQueue.main.async { [self] in
+            control = ControlServer { [weak self] args, reply in
+                guard let self else { return reply("not running", 1) }
+                self.command(args, reply: reply)
+            }
+            control?.start()
+            installCLI()
             browse()
             mediaKeys.handler = { [weak self] key, down, rep in self?.mediaKey(key, down: down, repeat: rep) ?? false }
             if NSApp.isActive { mediaKeys.enable() }
         }
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake),
-                                                          name: NSWorkspace.didWakeNotification, object: nil)
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        ws.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        watchNetwork()
     }
 
     // Closing the window hides it and the app keeps running, connected: launching it
@@ -63,6 +73,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     // the session already up. ⌘Q quits. After `idleDisconnect` hidden, the connection is
     // dropped (it's re-made in ~30 ms on the next show).
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Quit: say goodbye to the TV first (`_sessionStop`, ≤0.3 s) like Apple's remote.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let r = remote, r.status == .connected else { return .terminateNow }
+        r.goodbye { NSApp.reply(toApplicationShouldTerminate: true) }
+        return .terminateLater
+    }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
         show()
@@ -77,18 +94,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private static let idleDisconnect: Double = 600
     private var idleItem: DispatchWorkItem?
 
-    private func show() {
+    func show() {
         idleItem?.cancel()
         if !window.isVisible { Launch.reopened() }
         window.makeKeyAndOrderFront(nil)
         if !view.showsPairing { window.makeFirstResponder(view) }
         NSApp.activate()
         reconnectIfNeeded()
+        remote?.probe()
         remote?.refreshNowPlaying()
         updateTicker()
     }
 
-    private func hide() {
+    func hide() {
         releaseAll()
         window.orderOut(nil)
         updateTicker()
@@ -98,7 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             MainActor.assumeIsolated {
                 guard let self, !self.window.isVisible else { return }
                 self.retryItem?.cancel()
-                self.remote?.disconnect()
+                self.remote?.goodbye()
                 self.pairer?.disconnect()
             }
         }
@@ -111,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let tap = mediaKeys.enable()
         AppDelegate.log.info("active; accessibility \(MediaKeys.trusted ? "granted" : "not granted", privacy: .public), media-key tap \(tap ? "on" : "off", privacy: .public)")
         reconnectIfNeeded()
+        remote?.probe()
     }
 
     func applicationDidResignActive(_ note: Notification) {
@@ -120,7 +139,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func windowDidResignKey(_ notification: Notification) { releaseAll() }
 
-    @objc private func didWake() { reconnectIfNeeded(now: true) }
+    /// Mac sleep: close the session cleanly and don't retry while asleep; wake: a fresh
+    /// connection (the old socket may be half-open after the network went away).
+    @objc private func willSleep() {
+        retryItem?.cancel()
+        sleeping = true
+        remote?.goodbye()
+    }
+
+    @objc private func didWake() {
+        sleeping = false
+        guard window?.isVisible == true else { return }
+        remote?.reconnect()
+    }
+
+    private var sleeping = false
+    private var pathMonitor: NWPathMonitor?
+    private var pathSignature: String?
+
+    /// Network changes (Wi-Fi to Ethernet, another network, VPN up/down) leave the TCP
+    /// connections on a dead path; keepalive would notice only after ~20 s. Reconnect
+    /// right away instead, and as soon as a network comes back after none.
+    private func watchNetwork() {
+        let m = NWPathMonitor()
+        m.pathUpdateHandler = { [weak self] path in
+            let sig = "\(path.status) " + path.availableInterfaces.map(\.name).joined(separator: ",")
+                + " " + path.gateways.map { "\($0)" }.joined(separator: ",")
+            let ok = path.status == .satisfied
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.networkChanged(sig, satisfied: ok) } }
+        }
+        m.start(queue: .global(qos: .utility))
+        pathMonitor = m
+    }
+
+    private func networkChanged(_ sig: String, satisfied: Bool) {
+        defer { pathSignature = sig }
+        guard let old = pathSignature, old != sig, satisfied, !sleeping else { return }
+        AppDelegate.log.info("network changed; reconnecting")
+        guard window?.isVisible == true || remote?.status == .connected else { return }
+        retryCount = 0
+        remote?.reconnect()
+    }
 
     // MARK: - URLs
 
@@ -157,7 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
-    private func snapshot(to path: String) {
+    func snapshot(to path: String) {
         guard let v = window.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
         v.cacheDisplay(in: v.bounds, to: rep)
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
@@ -191,9 +250,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         view.onKey = { [weak self] e, down in self?.key(e, down: down) ?? false }
         view.title.target = self
         view.title.action = #selector(showDeviceMenu)
-        view.power.onPress = { [weak self] down in if !down { self?.remote?.togglePower() } }
-        view.captions.onPress = { [weak self] down in
-            if !down, self?.remote?.nowPlaying?.hasCaptions == true { self?.remote?.toggleCaptions() }
+        view.power.onClick = { [weak self] in self?.remote?.togglePower() }
+        view.captions.onClick = { [weak self] in
+            if self?.remote?.nowPlaying?.hasCaptions == true { self?.remote?.toggleCaptions() }
+        }
+        view.strip.onStatusClick = { [weak self] in
+            guard self?.remote?.status == .failed(ProtocolError.localNetworkDenied.description) else { return }
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork")!)
         }
         view.strip.onSeek = { [weak self] t in self?.remote?.seek(to: t) }
         view.text.onEdit = { [weak self] t in
@@ -232,7 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     // MARK: - Remote
 
     /// Makes `name` the controlled Apple TV and connects.
-    private func use(_ name: String, _ creds: Credentials) {
+    func use(_ name: String, _ creds: Credentials) {
         remote?.disconnect()
         let r = makeRemote(device(named: name), creds)
         remote = r
@@ -262,9 +325,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             guard let self, let r, r === self.remote else { return }
             self.updateHeader()
         }
-        r.onMediaReady = { [weak self, weak r] ok in
-            guard let self, let r, r === self.remote, self.window != nil else { return }
-            self.view.volume.muteAvailable = ok
+        r.onMediaReady = { [weak self, weak r] _ in
+            guard let self, let r, r === self.remote else { return }
+            self.updateHeader()
+        }
+        r.onControls = { [weak self, weak r] _ in
+            guard let self, let r, r === self.remote else { return }
+            self.updateHeader()
         }
         r.onTextSession = { [weak self, weak r] s in
             guard let self, let r, r === self.remote else { return }
@@ -293,11 +360,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case .connected:
             retryCount = 0
             if let name = remote?.device.name, store.last != name { try? store.touch(name) }
-        case .failed:
+        case .failed(let e):
             scheduleRetry()
+            if e.hasPrefix("couldn't find") || e == ProtocolError.timeout.description { followRename() }
         default:
             break
         }
+    }
+
+    // MARK: - Renamed TVs
+
+    private var renameProbe: Remote?
+    private var lastRenameProbe = Date.distantPast
+
+    /// Pairings are stored by the TV's name, which is also how it's found (Bonjour). If
+    /// the TV was renamed, the old name is gone; any Apple TV on the network whose name
+    /// isn't paired is tried with the current credentials: pair-verify only succeeds on
+    /// the TV that holds them (it proves its identity), and then the pairing moves over.
+    private func followRename() {
+        guard renameProbe == nil, Date().timeIntervalSince(lastRenameProbe) > 30,
+              let r = remote, let creds = r.credentials else { return }
+        let paired = Set(store.entries.map(\.name))
+        guard let candidate = devices.first(where: { !paired.contains($0.name) }) else { return }
+        lastRenameProbe = Date()
+        let old = r.device.name
+        let p = Remote(device: candidate, credentials: creds)
+        renameProbe = p
+        p.onStatus = { [weak self, weak p] s in
+            guard let self, let p, p === self.renameProbe else { return }
+            switch s {
+            case .connected:
+                AppDelegate.log.notice("\(old, privacy: .public) is now \(candidate.name, privacy: .public)")
+                self.renameProbe = nil
+                try? self.store.remove(old)
+                try? self.store.save(candidate.name, creds)
+                self.remote?.disconnect()
+                self.remote = p
+                self.adopt(p)
+                self.showRemote(p)
+                self.statusChanged(s)
+            case .failed, .unpaired:
+                self.renameProbe = nil
+                p.disconnect()
+            default:
+                break
+            }
+        }
+        p.connect()
     }
 
     /// Reconnects after a failure while the app is in use: quickly at first (a TV that
@@ -338,12 +447,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case .connected, .idle: nil
         case .connecting, .pairing: "Connecting…"
         case .unpaired: "\(r.device.name) forgot this Mac. Pair again from the menu above."
+        case .failed(let e) where e == ProtocolError.localNetworkDenied.description:
+            "Local Network access is off. Click to allow it."
         case .waitingForPIN: "Pairing…"
         case .failed(let e): e.prefix(1).uppercased() + e.dropFirst()
         }
-        view.strip.show(status == nil ? r.nowPlaying : nil, status: status)
+        view.strip.show(status == nil ? r.nowPlaying : nil, status: status, seekable: r.canSeek)
         view.setPower(asleep: r.power == .asleep)
-        view.volume.muteAvailable = r.muteAvailable
+        let known = r.controlsKnown && r.status == .connected
+        let volume = !known || r.controls.contains(.volume)
+        view.setAvailability(skip: !known || r.controls.contains(.skipForward) || r.controls.contains(.skipBackward),
+                             volume: volume)
+        view.volume.muteAvailable = r.muteAvailable && volume
         let np = r.nowPlaying
         view.setCaptions(available: np?.hasCaptions ?? false, on: np?.captionsEnabled ?? false)
         updateTicker()

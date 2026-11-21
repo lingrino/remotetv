@@ -1,15 +1,14 @@
 import Foundation
 import RemoteCore
 
-// tvctl: command-line client over RemoteCore, for exercising the protocol against a real
-// Apple TV without the UI. Shares the app's pairing store.
-//   tvctl scan                       list Apple TVs on the network (3 s)
-//   tvctl pair <tv>                  pair: the TV shows a PIN, type it on stdin
-//   tvctl status [tv]                connect, print timings, power state, controls
-//   tvctl press [tv:] <button>...    click buttons (up down left right select menu home
-//                                    playpause volumeup volumedown …), e.g. `tvctl press down select`
-//   tvctl skip [tv:] <seconds>       skip playback (negative = back)
-//   tvctl sleep|wake [tv]
+// tvctl: the RemoteTV command line. Installed with the app (a symlink in ~/.local/bin).
+//
+// Normal commands go to the running app over its control socket and use the app's own
+// session (no handshake, no fighting over the TV's one connection per pairing); the app
+// is started in the background if it isn't running. See `tvctl help`.
+//
+// `tvctl direct …` talks to the TV itself (its own connection, which kicks the app's off
+// while it runs): protocol work and debugging. `scan` and `pair` are always direct.
 
 func die(_ s: String) -> Never {
     FileHandle.standardError.write(Data((s + "\n").utf8))
@@ -60,8 +59,76 @@ func session(_ r: Remote, linger: Double = 0.5, _ body: @escaping @MainActor () 
     withExtendedLifetime(r) { dispatchMain() }
 }
 
+// MARK: - Through the app
+
+let controlPath = CredentialStore.defaultURL.deletingLastPathComponent().appending(path: "control.sock").path
+
+/// Connects to the app's socket; nil if it isn't listening.
+func connectToApp() -> Int32? {
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return nil }
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+        let b = Array(controlPath.utf8.prefix(raw.count - 1))
+        raw.copyBytes(from: b)
+        raw[b.count] = 0
+    }
+    let ok = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+    }
+    if ok != 0 { close(fd); return nil }
+    return fd
+}
+
+/// Sends a command to the app (starting it if needed), prints its reply, exits with its code.
+func viaApp(_ args: [String]) -> Never {
+    var fd = connectToApp()
+    if fd == nil {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-g", "-b", "com.lingrino.remotetv"]
+        try? p.run()
+        p.waitUntilExit()
+        for _ in 0..<100 where fd == nil {
+            usleep(50_000)
+            fd = connectToApp()
+        }
+    }
+    guard let fd else { die("RemoteTV isn't running and didn't start") }
+    let line = Array((args.joined(separator: "\u{1F}") + "\n").utf8)
+    _ = line.withUnsafeBufferPointer { write(fd, $0.baseAddress, $0.count) }
+    var out: [UInt8] = []
+    var buf = [UInt8](repeating: 0, count: 65536)
+    while true {
+        let n = read(fd, &buf, buf.count)
+        if n <= 0 { break }
+        out += buf[0..<n]
+    }
+    close(fd)
+    var text = String(decoding: out, as: UTF8.self)
+    var code: Int32 = 1
+    if let r = text.range(of: "\u{1F}", options: .backwards) {
+        code = Int32(text[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 1
+        text = String(text[..<r.lowerBound])
+    }
+    if code == 0 { FileHandle.standardOutput.write(Data(text.utf8)) } else { FileHandle.standardError.write(Data(text.utf8)) }
+    exit(code)
+}
+
+do {
+    let all = Array(CommandLine.arguments.dropFirst())
+    let first = all.first ?? "help"
+    if first != "direct" && first != "scan" && first != "pair" && first != "-v" {
+        viaApp(all.isEmpty ? ["help"] : all)
+    }
+}
+
+// MARK: - Direct (own connection)
+
 MainActor.assumeIsolated {
     var args = Array(CommandLine.arguments.dropFirst())
+    if args.first == "direct" { args.removeFirst() }
     let verbose = args.first == "-v"
     if verbose { args.removeFirst() }
     Trace.on = verbose
@@ -89,6 +156,11 @@ MainActor.assumeIsolated {
             var store = CredentialStore()
             do { try store.save(name, c) } catch { die("couldn't save the pairing: \(error)") }
             print("paired with \(name)")
+            if let fd = connectToApp() {   // the running app picks the pairing up
+                let line = Array("reload\n".utf8)
+                _ = line.withUnsafeBufferPointer { write(fd, $0.baseAddress, $0.count) }
+                close(fd)
+            }
         }
         r.onTiming = { what, d in print("\(what): \(stamp(d))") }
         r.onStatus = { s in

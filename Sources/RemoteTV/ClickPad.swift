@@ -91,18 +91,26 @@ final class ClickPad: NSView {
             onTouch?(500, 500, 1)
             overlay.swiping = true
         }
-        guard var t = touch else { return }
-        if event.phase.contains(.changed) {
-            t.x = min(1000, max(0, t.x + dx))
-            t.y = min(1000, max(0, t.y + dy))
-            touch = t
-            onTouch?(t.x, t.y, 3)
-        }
         if event.phase.contains(.ended) || event.phase.contains(.cancelled) {
-            onTouch?(t.x, t.y, 4)
+            if let t = touch { onTouch?(t.x, t.y, 4) }
             touch = nil
             overlay.swiping = false
+            return
         }
+        guard var t = touch, event.phase.contains(.changed) else { return }
+        let nx = t.x + dx, ny = t.y + dy
+        if nx < 0 || nx > 1000 || ny < 0 || ny > 1000 {
+            // The virtual finger reached the pad's edge: lift it there and put it down at
+            // the center with the next movement, so a long swipe keeps going (pinning it
+            // at the edge would stall). Never a lift without motion: that would be a tap.
+            onTouch?(min(1000, max(0, nx)), min(1000, max(0, ny)), 4)
+            touch = nil
+            return
+        }
+        t.x = nx
+        t.y = ny
+        touch = t
+        onTouch?(t.x, t.y, 3)
     }
 
     /// Chevrons, the center ring and the pressed-wedge highlight, drawn in one view.

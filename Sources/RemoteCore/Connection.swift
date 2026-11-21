@@ -109,8 +109,28 @@ final class Connection {
 
     var isEncrypted: Bool { cipher != nil }
 
+    /// The TV's address once connected (remembered for waking it later).
+    var remoteHost: NWEndpoint.Host? {
+        if case let .hostPort(host, _)? = nw.currentPath?.remoteEndpoint { return host }
+        return nil
+    }
+
+    /// Sends and calls `done` (on the main queue) once the kernel has the bytes or the
+    /// send failed.
+    func send(_ type: FrameType, _ payload: [UInt8], then done: @escaping @MainActor () -> Void) {
+        guard !closed else { return done() }
+        nw.send(content: frame(type, payload), completion: .contentProcessed { _ in
+            DispatchQueue.main.async { MainActor.assumeIsolated { done() } }
+        })
+    }
+
     func send(_ type: FrameType, _ payload: [UInt8]) {
         guard !closed else { return }
+        nw.send(content: frame(type, payload), completion: .idempotent)
+    }
+
+    /// Frame header, then the payload (encrypted once the session is).
+    private func frame(_ type: FrameType, _ payload: [UInt8]) -> [UInt8] {
         let length = payload.count + (cipher != nil && !payload.isEmpty ? 16 : 0)
         var frame: [UInt8] = [type.rawValue, UInt8(truncatingIfNeeded: length >> 16),
                               UInt8(truncatingIfNeeded: length >> 8), UInt8(truncatingIfNeeded: length)]
@@ -120,7 +140,7 @@ final class Connection {
         } else {
             frame.append(contentsOf: payload)
         }
-        nw.send(content: frame, completion: .idempotent)
+        return frame
     }
 
     private func stateChanged(_ state: NWConnection.State) {
@@ -133,6 +153,8 @@ final class Connection {
         case .waiting(let err):
             // No route/refused: report instead of letting Network retry forever; the
             // owner decides when to try again.
+            if nw.currentPath?.unsatisfiedReason == .localNetworkDenied { return finish(.localNetworkDenied) }
+            if case .dns(let code) = err, code == -65570 { return finish(.localNetworkDenied) }   // kDNSServiceErr_PolicyDenied
             finish(.connection(Connection.describe(err)))
         case .cancelled:
             finish(nil)

@@ -101,6 +101,14 @@ final class RemoteView: NSView {
         captions.setAccessibilityLabel(available ? (on ? "Subtitles On" : "Subtitles Off") : "No Subtitles")
     }
 
+    /// Dims what the TV says won't work right now (it acknowledges every press either way).
+    func setAvailability(skip: Bool, volume: Bool) {
+        let a: CGFloat = 0.35
+        skipBack.alphaValue = skip ? 1 : a
+        skipForward.alphaValue = skip ? 1 : a
+        self.volume.alphaValue = volume ? 1 : a
+    }
+
     func setPower(asleep: Bool) {
         power.tint = asleep ? .tertiaryLabelColor : nil
         power.setAccessibilityLabel(asleep ? "Wake" : "Sleep")
@@ -124,6 +132,9 @@ final class NowPlayingStrip: NSView {
     let remaining = NSTextField(labelWithString: "")
     /// Seek requested (seconds), on release.
     var onSeek: ((Double) -> Void)?
+    /// A click on the title line while it shows a status (e.g. open Privacy settings).
+    var onStatusClick: (() -> Void)?
+    private var showingStatus = false
     private(set) var scrubbing = false
 
     override var isFlipped: Bool { true }
@@ -161,8 +172,13 @@ final class NowPlayingStrip: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    override func mouseDown(with event: NSEvent) {
+        if showingStatus, let onStatusClick { onStatusClick() } else { super.mouseDown(with: event) }
+    }
+
     /// Updates for an item (nil: nothing playing) or a connection status line.
-    func show(_ np: NowPlaying?, status: String?) {
+    func show(_ np: NowPlaying?, status: String?, seekable: Bool = true) {
+        showingStatus = status != nil
         if let status {
             label.stringValue = status
             label.textColor = .secondaryLabelColor
@@ -173,7 +189,7 @@ final class NowPlayingStrip: NSView {
             label.stringValue = "Not Playing"
             label.textColor = .tertiaryLabelColor
         }
-        let seekable = status == nil && (np?.duration ?? 0) > 0
+        let seekable = seekable && status == nil && (np?.duration ?? 0) > 0
         slider.isHidden = !seekable
         elapsed.isHidden = !seekable
         remaining.isHidden = !seekable
@@ -292,6 +308,8 @@ final class TextBar: NSView {
 
         override func textDidChange(_ notification: Notification) {
             super.textDidChange(notification)
+            // An IME composition (marked text) isn't text yet: send it once committed.
+            if let editor = currentEditor() as? NSTextView, editor.hasMarkedText() { return }
             onEdit?(stringValue)
         }
 

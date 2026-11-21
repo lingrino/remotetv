@@ -102,6 +102,12 @@ public enum OPACK {
 
         public mutating func int(_ v: Int) { int(Int64(v)) }
 
+        /// Unsigned values that may exceed Int64 (session ids): always 8 bytes.
+        public mutating func uint(_ v: UInt64) {
+            if v <= UInt64(Int64.max) { return int(Int64(v)) }
+            bytes.append(0x33); appendLE(v, 8)
+        }
+
         public mutating func double(_ v: Double) {
             bytes.append(0x36)
             appendLE(v.bitPattern, 8)

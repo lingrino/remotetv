@@ -12,7 +12,10 @@ enum Theme {
 /// Shared down/up plumbing for remote controls: a press is "down" on mouse-down and "up"
 /// on mouse-up (wherever the mouse is then), so holding a button holds it on the TV.
 class PressView: NSView {
+    /// Down/up, for buttons the TV holds (the up always follows, wherever the mouse is).
     var onPress: ((Bool) -> Void)?
+    /// A completed click (released over the button), for one-shot actions.
+    var onClick: (() -> Void)?
     private(set) var pressed = false
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -29,6 +32,7 @@ class PressView: NSView {
         pressed = false
         pressChanged()
         onPress?(false)
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
     }
 
     func pressChanged() {}
@@ -140,6 +144,9 @@ final class VolumePill: NSView {
         guard let p = active else { return }
         active = nil
         glass.tintColor = nil
+        // Mute is one-shot: only when released over it. − and + are held buttons.
+        let q = convert(event.locationInWindow, from: nil)
+        if p == .mute && (!bounds.contains(q) || part(at: q.x) != .mute) { return }
         onPress?(p, false)
     }
 }

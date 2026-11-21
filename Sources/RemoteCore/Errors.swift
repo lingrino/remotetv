@@ -10,6 +10,8 @@ public enum ProtocolError: Error, Equatable, Sendable, CustomStringConvertible {
     /// The connection failed or closed.
     case connection(String)
     case timeout
+    /// macOS Local Network privacy is off for this app.
+    case localNetworkDenied
 
     public var description: String {
         switch self {
@@ -18,6 +20,7 @@ public enum ProtocolError: Error, Equatable, Sendable, CustomStringConvertible {
         case .remote(let s): "Apple TV error: \(s)"
         case .connection(let s): s
         case .timeout: "the Apple TV didn't answer"
+        case .localNetworkDenied: "Local Network access is off for RemoteTV"
         }
     }
 }

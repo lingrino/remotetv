@@ -246,6 +246,9 @@ public final class AirPlayTunnel {
     private var eventBuffer: [UInt8] = []
     private var dataBuffer: [UInt8] = []
     private var waiting: [(HTTPMessage) -> Void] = []
+    /// When each waiting request was sent: a control channel that stops answering (6 s,
+    /// three missed feedbacks) is torn down and the owner retries.
+    private var waitingSince: [ContinuousClock.Instant] = []
     private var cseq = 0
     private let sessionID = UInt32.random(in: 1...UInt32.max)
     private let dacpID = String(UInt64.random(in: 1...UInt64.max), radix: 16, uppercase: true)
@@ -305,6 +308,7 @@ public final class AirPlayTunnel {
         control = nil; events = nil; data = nil
         controlBuffer.removeAll(); eventBuffer.removeAll(); dataBuffer.removeAll()
         waiting.removeAll()
+        waitingSince.removeAll()
     }
 
     private func fail(_ e: ProtocolError) {
@@ -325,6 +329,7 @@ public final class AirPlayTunnel {
         cseq += 1
         h += headers
         waiting.append(reply)
+        waitingSince.append(.now)
         control.send(HTTPMessage(startLine: "\(method) \(uri) \(proto)", headers: h, body: body).encoded())
     }
 
@@ -334,6 +339,7 @@ public final class AirPlayTunnel {
         do throws(ProtocolError) {
             while let msg = try HTTPMessage.take(from: &controlBuffer) {
                 guard !waiting.isEmpty else { continue }
+                waitingSince.removeFirst()
                 waiting.removeFirst()(msg)
             }
         } catch {
@@ -462,7 +468,13 @@ public final class AirPlayTunnel {
         timeout?.cancel()
         state = .ready
         let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.request("POST", "/feedback") { _ in } }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if let oldest = self.waitingSince.first, ContinuousClock.now - oldest > .seconds(6) {
+                    return self.fail(.connection("AirPlay stopped responding"))
+                }
+                self.request("POST", "/feedback") { _ in }
+            }
         }
         t.tolerance = 0.2
         RunLoop.main.add(t, forMode: .common)
