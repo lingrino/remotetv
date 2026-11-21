@@ -98,13 +98,12 @@ final class RemoteView: NSView {
         captions.alphaValue = available ? 1 : 0.35
         captions.symbol = on ? "captions.bubble.fill" : "captions.bubble"
         captions.tint = on ? .controlAccentColor : nil
-        captions.toolTip = available ? (on ? "Subtitles On" : "Subtitles Off") : "No subtitles for this"
+        captions.setAccessibilityLabel(available ? (on ? "Subtitles On" : "Subtitles Off") : "No Subtitles")
     }
 
     func setPower(asleep: Bool) {
         power.tint = asleep ? .tertiaryLabelColor : nil
         power.setAccessibilityLabel(asleep ? "Wake" : "Sleep")
-        power.toolTip = asleep ? "Wake" : "Sleep"
     }
 
     override func keyDown(with event: NSEvent) {

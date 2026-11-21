@@ -22,6 +22,10 @@ This file is the agent guide (Claude Code reads it when there is no CLAUDE.md; d
   launcher). Launching it again must show it immediately.
 - Local git repo only for now (no remote, no CI, no releases).
 
+Round 4 (2026-11-21): mute, scrubbing and now playing confirmed working. MRP subtitles
+broke audio (see Protocol notes) — reverted to Companion ToggleCaptions. No placeholder in
+the text bar; no hover text (tooltips) anywhere — keep it that way.
+
 Round 3 (2026-11-21): text bar redesigned (glass capsule), ⌘C/⌘X/⌘Z, typing sent as
 delete/insert edits (YouTube doesn't report its field's text, so replace wiped it). The
 owner accepted building the AirPlay/MRP tunnel "only if very reliable and unnoticeable":
@@ -200,11 +204,16 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
   isAlwaysLive 37, elapsedTimeTimestamp 74}. Every app reports here (Prime, YouTube…),
   unlike Companion's NowPlayingInfo (Apple-TV-app-centric, flaky: owner saw it drop).
   Commands: SeekToPlaybackPosition (SendCommand 1/6 {command 45, options {playbackPosition
-  9}}); subtitles = Enable/DisableLanguageOption (53/54, options.languageOption 27 = the
-  LanguageOption protobuf bytes as received; type 1 = legible, 0 = audible) — only apps
-  using AVKit publish options (TV app: yes; Prime's own player: none, so the button falls
-  back to Companion ToggleCaptions there); mute = SendHIDEvent (8/13) consumer page 12,
-  usage 0xE2, down+up, then an empty GENERIC (42) flush. The 60-byte HID event template is
+  9}}); mute = SendHIDEvent (8/13) consumer page 12,
+  usage 0xE2, down+up, then an empty GENERIC (42) flush.
+  **Subtitles: never send EnableLanguageOption (53) / DisableLanguageOption (54)** with
+  options.languageOption 27 = a LanguageOption from the item: tried 2026-11-21 in the TV
+  app, the show's audio went silent until the owner re-picked an audio track (the command
+  apparently replaces the whole media selection). The button sends Companion
+  `ToggleCaptions` (what Apple's remote does; flaky on Apple's remote too). MRP language
+  options (ContentItem 5/6; LanguageOption type 1 = legible, 0 = audible) are still read
+  for the button's availability and on/off state; only AVKit players publish them (TV
+  app yes, Prime no). The 60-byte HID event template is
   in `MediaRemote.hidEvent` (test pins pyatv's known-good bytes). Mute state isn't
   reported for HDMI-CEC audio, so the button doesn't show muted/unmuted.
 - Mute/volume background: the iOS remote mutes through HomeKit (TVRemoteCore: "Sending

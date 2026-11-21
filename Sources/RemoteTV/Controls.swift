@@ -57,7 +57,6 @@ final class GlassButton: PressView {
         addSubview(icon)
         setAccessibilityRole(.button)
         setAccessibilityLabel(label)
-        toolTip = label
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -119,7 +118,6 @@ final class VolumePill: NSView {
                                 accessibilityDescription: muted ? "Unmute" : "Mute")?
             .withSymbolConfiguration(.init(pointSize: Theme.symbolSize - 3, weight: .regular))
         speaker.contentTintColor = muted ? .controlAccentColor : (muteAvailable ? .secondaryLabelColor : .quaternaryLabelColor)
-        toolTip = muteAvailable ? (muted ? "Unmute" : "Mute") : "Volume"
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -160,7 +158,6 @@ final class IconButton: PressView {
         addSubview(icon)
         setAccessibilityRole(.button)
         setAccessibilityLabel(label)
-        toolTip = label
     }
 
     required init?(coder: NSCoder) { fatalError() }

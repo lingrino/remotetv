@@ -380,7 +380,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let s {
             sentText = s.text
             view.text.field.stringValue = s.text
-            view.text.field.placeholderString = "Type on \(remote?.device.name ?? "the TV")"
             view.showText(true)
             window.makeFirstResponder(view.text.field)
             view.text.field.currentEditor()?.selectedRange = NSRange(location: (s.text as NSString).length, length: 0)
@@ -409,14 +408,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let current = remote?.device.name
         var names = store.entries.map(\.name)
         for d in devices where !names.contains(d.name) { names.append(d.name) }
-        let online = Set(devices.map(\.name))
         for name in names {
             let item = NSMenuItem(title: name, action: #selector(menuPick(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = name
             item.state = name == current ? .on : .off
             if store.credentials(for: name) == nil { item.title = "\(name) — Pair…" }
-            if !online.contains(name) && !devices.isEmpty { item.toolTip = "Not seen on this network" }
             menu.addItem(item)
         }
         if names.isEmpty {

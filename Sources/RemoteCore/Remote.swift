@@ -648,14 +648,12 @@ public final class Remote {
         request("FetchCurrentNowPlayingInfoEvent", count: 0) { _ in }
     }
 
-    /// Subtitles on/off for the playing item (when it has caption tracks): MRP language
-    /// options when the tunnel is up (reliable, state comes back), else Companion's
-    /// ToggleCaptions.
+    /// Subtitles on/off for the playing item: Companion `ToggleCaptions`, which is what
+    /// Apple's own remote sends. (MRP EnableLanguageOption looked cleaner but replaced the
+    /// item's whole media selection on the owner's TV: audio went silent. Don't use it.)
+    /// The resulting state shows up through now playing (MRP language options when the
+    /// app publishes them, else Companion's flags).
     public func toggleCaptions() {
-        if let m = media, m.isReady, nowPlaying?.captionsFromMRP == true {
-            m.toggleSubtitles()
-            return
-        }
         whenConnected { [weak self] in
             self?.request("ToggleCaptions", count: 0) { _ in
                 // The TV doesn't always push a new snapshot after a toggle: ask.

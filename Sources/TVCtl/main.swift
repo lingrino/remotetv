@@ -225,7 +225,7 @@ MainActor.assumeIsolated {
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { exit(0) }
         withExtendedLifetime(t) { dispatchMain() }
 
-    case "mrp", "mute", "mseek", "subs":
+    case "mrp", "mute", "mseek":
         // MRP over the AirPlay tunnel: `mrp [seconds]` prints now playing and message types;
         // `mute` toggles mute; `mseek <s>` seeks to an absolute position.
         let store = CredentialStore()
@@ -247,7 +247,6 @@ MainActor.assumeIsolated {
             guard ok else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 if cmd == "mute" { print("mute"); m.toggleMute() }
-                if cmd == "subs" { print("subtitles"); m.toggleSubtitles() }
                 if cmd == "mseek", let to = arg { print("seek \(to)"); m.seek(to: to) }
             }
         }

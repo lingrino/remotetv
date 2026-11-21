@@ -198,32 +198,6 @@ public final class MediaRemote {
         }
     }
 
-    /// Subtitles on/off for the playing item, through its language options: enable the
-    /// first legible option (type 1) — the group's default if it has one — or disable the
-    /// legible option currently selected. The TV's next SetState shows the result.
-    public func toggleSubtitles() {
-        guard isReady, let item = activeItem else { return }
-        let current = item.datas(6).filter { (try? ProtoMessage($0))?.int(1) == 1 }
-        let (command, option): (Int, [UInt8]?)
-        if let on = current.first {
-            (command, option) = (54, on)
-        } else {
-            var pick: [UInt8]?
-            for g in item.messages(5) {
-                let legible = g.datas(3).filter { (try? ProtoMessage($0))?.int(1) == 1 }
-                guard let first = legible.first else { continue }
-                if let d = g.bytes(2), (try? ProtoMessage(d))?.int(1) == 1 { pick = d } else { pick = first }
-                break
-            }
-            (command, option) = (53, pick)
-        }
-        guard let option else { return }
-        tunnel.send(MediaRemote.message(type: MessageType.sendCommand, identifier: UUID().uuidString, ext: Ext.sendCommand) { w in
-            w.int(1, command)
-            w.message(2) { o in o.data(27, option) }
-        })
-    }
-
     /// Whether the active player accepts a command (e.g. 45 seek).
     public func supports(_ command: Int) -> Bool {
         activePlayer?.commands.contains { $0.int(1) == command && ($0.bool(2) ?? true) } ?? false
@@ -246,11 +220,6 @@ public final class MediaRemote {
     private var clients: [String: Client] = [:]
     private var activeClient: String?
     private static let defaultPlayer = "MediaRemote-DefaultPlayer"
-
-    private var activeItem: ProtoMessage? {
-        guard let p = activePlayer, p.location < p.items.count else { return nil }
-        return try? ProtoMessage(p.items[p.location].item)
-    }
 
     private var activePlayer: Player? {
         guard let c = activeClient.flatMap({ clients[$0] }) else { return nil }
