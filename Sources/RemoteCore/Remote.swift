@@ -710,6 +710,11 @@ public final class Remote {
 
     public var muteAvailable: Bool { media?.isReady == true }
 
+    /// Ask for now-playing artwork (MRP) while something shows it.
+    public var wantsArtwork = false {
+        didSet { media?.wantsArtwork = wantsArtwork }
+    }
+
     /// Whether the scrubber can move playback: MRP absolute seek, or Companion skips (the
     /// TV's flags; assumed yes until it has said).
     public var canSeek: Bool {
@@ -731,6 +736,7 @@ public final class Remote {
     private func startMedia() {
         guard media == nil, let credentials else { return }
         let m = MediaRemote(device: device, credentials: credentials, name: clientName)
+        m.wantsArtwork = wantsArtwork
         media = m
         m.onReady = { [weak self, weak m] ok in
             guard let self, let m, m === self.media else { return }

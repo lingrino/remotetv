@@ -22,6 +22,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let mediaKeys = MediaKeys()
     private var heldKeys: [UInt16: Button] = [:]
     private var control: ControlServer?
+    private let root = Flipped()
+
+    // MARK: Sidebar state (see Sidebar.swift)
+    private var sidebar: Sidebar?
+    private(set) var sidebarOpen = false
+    private var tvApps: [TVApp]?
+    private var loadingApps = false
+    private var upNext: [UpNextItem]?
+
+    func sidebarTab(_ t: Int) {
+        sidebar?.tab = t
+        UserDefaults.standard.set(t, forKey: "sidebarTab")
+    }
     private var retryCount = 0
     private var retryItem: DispatchWorkItem?
 
@@ -50,6 +63,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(view)
         Launch.mark("window")
+        if UserDefaults.standard.bool(forKey: "sidebarOpen") {
+            DispatchQueue.main.async { [self] in setSidebar(true, animate: false) }
+        }
         DispatchQueue.main.async { Launch.mark("nextTurn") }
         DispatchQueue.main.async { [self] in
             control = ControlServer { [weak self] args, reply in
@@ -104,12 +120,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         remote?.probe()
         remote?.refreshNowPlaying()
         updateTicker()
+        if sidebarOpen { remote?.wantsArtwork = true; loadSidebar() }
     }
 
     func hide() {
         releaseAll()
         window.orderOut(nil)
         updateTicker()
+        remote?.wantsArtwork = false
         NSApp.hide(nil)
         idleItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
@@ -209,6 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 }
                 if let path { snapshot(to: path) }
             case "pairing": startPairing()
+            case "sidebar": toggleSidebar()
             case "sleep": remote?.sleep()
             case "wake": remote?.wake()
             default: AppDelegate.log.notice("unknown URL \(url.absoluteString, privacy: .public)")
@@ -234,7 +253,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentView = view
+        root.frame = view.frame
+        root.addSubview(view)
+        window.contentView = root
         window.animationBehavior = .none
         // Restore the position (keeping the top edge) but never a stale size from an
         // older layout.
@@ -250,6 +271,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         view.onKey = { [weak self] e, down in self?.key(e, down: down) ?? false }
         view.title.target = self
         view.title.action = #selector(showDeviceMenu)
+        view.sidebarButton.target = self
+        view.sidebarButton.action = #selector(toggleSidebar)
         view.power.onClick = { [weak self] in self?.remote?.togglePower() }
         view.captions.onClick = { [weak self] in
             if self?.remote?.nowPlaying?.hasCaptions == true { self?.remote?.toggleCaptions() }
@@ -368,6 +391,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
+    // MARK: - Sidebar
+
+    @objc func toggleSidebar() { setSidebar(!sidebarOpen, animate: true) }
+
+    /// Opens or closes the sidebar by widening the window to the right (the remote stays
+    /// where it is; near the screen's right edge the window shifts left to fit).
+    func setSidebar(_ open: Bool, animate: Bool) {
+        guard open != sidebarOpen, let window else { return }
+        sidebarOpen = open
+        UserDefaults.standard.set(open, forKey: "sidebarOpen")
+        let h = RemoteView.height
+        let width = open ? Theme.width + Sidebar.width + Sidebar.inset : Theme.width
+        if open {
+            let s = sidebar ?? makeSidebar()
+            s.isHidden = false
+        }
+        var f = window.frame
+        f.size.width = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: width, height: h)).width
+        if open, let vis = window.screen?.visibleFrame, f.maxX > vis.maxX { f.origin.x = max(vis.minX, vis.maxX - f.width) }
+        window.setFrame(f, display: true, animate: animate)
+        root.frame = NSRect(x: 0, y: 0, width: width, height: h)
+        if !open { sidebar?.isHidden = true }
+        view.sidebarButton.contentTintColor = open ? .labelColor : .secondaryLabelColor
+        remote?.wantsArtwork = open && window.isVisible
+        if open { loadSidebar() }
+    }
+
+    private func makeSidebar() -> Sidebar {
+        let s = Sidebar(frame: NSRect(x: Theme.width, y: Sidebar.inset, width: Sidebar.width,
+                                      height: RemoteView.height - 2 * Sidebar.inset))
+        s.onPlay = { [weak self] item in
+            guard let url = item.actionURL else { return }
+            self?.remote?.open(url: url)
+        }
+        s.onLaunch = { [weak self] app in self?.remote?.launch(bundleID: app.bundleID) }
+        s.onTab = { UserDefaults.standard.set($0, forKey: "sidebarTab") }
+        s.tab = UserDefaults.standard.integer(forKey: "sidebarTab")
+        root.addSubview(s)
+        sidebar = s
+        return s
+    }
+
+    /// Fresh Up Next every time it's shown (it changes as you watch); apps (with icons)
+    /// once per run, unless the installed set changed.
+    private func loadSidebar() {
+        guard let r = remote, let s = sidebar else { return }
+        s.setNowPlaying(r.nowPlaying, app: app(for: r.nowPlaying?.bundleID))
+        r.fetchUpNext { [weak self] items in
+            guard let self else { return }
+            if let items { self.upNext = items }
+            // A failed fetch keeps what was there (the TV's Up Next service has hiccups).
+            self.sidebar?.setUpNext(items ?? self.upNext, failed: items == nil && self.upNext == nil)
+        }
+        if tvApps == nil { s.setApps(nil) } else { s.setApps(tvApps) }
+        guard !loadingApps else { return }
+        loadingApps = true
+        r.fetchApps(icons: false) { [weak self] names in
+            guard let self else { return }
+            if let have = self.tvApps, Set(have.map(\.bundleID)) == Set(names.map(\.bundleID)) {
+                self.loadingApps = false
+                return
+            }
+            r.fetchApps(icons: true) { [weak self] apps in
+                guard let self else { return }
+                self.loadingApps = false
+                self.tvApps = apps
+                self.sidebar?.setApps(apps)
+                self.sidebar?.setNowPlaying(r.nowPlaying, app: self.app(for: r.nowPlaying?.bundleID))
+            }
+        }
+    }
+
+    private func app(for bundleID: String?) -> TVApp? {
+        guard let bundleID else { return nil }
+        return tvApps?.first { $0.bundleID == bundleID }
+    }
+
     // MARK: - Renamed TVs
 
     private var renameProbe: Remote?
@@ -454,6 +554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         view.strip.show(status == nil ? r.nowPlaying : nil, status: status, seekable: r.canSeek)
         view.setPower(asleep: r.power == .asleep)
+        if sidebarOpen { sidebar?.setNowPlaying(status == nil ? r.nowPlaying : nil, app: app(for: r.nowPlaying?.bundleID)) }
         let known = r.controlsKnown && r.status == .connected
         let volume = !known || r.controls.contains(.volume)
         view.setAvailability(skip: !known || r.controls.contains(.skipForward) || r.controls.contains(.skipBackward),
@@ -751,6 +852,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let winMenu = NSMenu(title: "Window")
         winMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         winMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        winMenu.addItem(.separator())
+        let sb = winMenu.addItem(withTitle: "Show Sidebar", action: #selector(toggleSidebar), keyEquivalent: "s")
+        sb.keyEquivalentModifierMask = [.control, .command]
+        sb.target = self
         winItem.submenu = winMenu
         NSApp.mainMenu = main
         NSApp.windowsMenu = winMenu

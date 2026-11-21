@@ -23,6 +23,8 @@ public struct NowPlaying: Sendable, Equatable {
     public var artwork: [UInt8]?
     /// The subtitle fields came from MRP language options (trusted over Companion's).
     public var captionsFromMRP = false
+    /// The TV's id for the item (MRP content item identifier), when known.
+    public var itemID: String?
 
     public var isPlaying: Bool { state == 1 && rate != 0 }
 

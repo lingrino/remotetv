@@ -8,6 +8,7 @@ import RemoteCore
 /// coordinates; sizes from `Theme`.
 final class RemoteView: NSView {
     let title = NSButton(title: "", target: nil, action: nil)
+    let sidebarButton = NSButton(title: "", target: nil, action: nil)
     let strip = NowPlayingStrip(frame: NSRect(x: 0, y: 28, width: Theme.width, height: 46))
     let text = TextBar(frame: NSRect(x: 18, y: 34, width: Theme.width - 36, height: 36))
 
@@ -47,6 +48,14 @@ final class RemoteView: NSView {
         title.frame = NSRect(x: 80, y: 4, width: w - 160, height: 22)
         title.alignment = .center
         addSubview(title)
+
+        sidebarButton.isBordered = false
+        sidebarButton.refusesFirstResponder = true
+        sidebarButton.image = NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: "Sidebar")?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+        sidebarButton.contentTintColor = .secondaryLabelColor
+        sidebarButton.frame = NSRect(x: w - 38, y: 3, width: 28, height: 24)
+        addSubview(sidebarButton)
 
         addSubview(strip)
         text.isHidden = true

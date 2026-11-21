@@ -22,6 +22,12 @@ This file is the agent guide (Claude Code reads it when there is no CLAUDE.md; d
   launcher). Launching it again must show it immediately.
 - Local git repo only for now (no remote, no CI, no releases).
 
+Round 5 (2026-11-21): "very thorough and reliable" pass (see Reliability). The main view
+stays exactly as simple as it is — no artwork or lists there; those live in a sidebar that
+slides out on demand (the owner left its design to the agent: "care about design… make
+something great"). tvctl ships inside the app, lands on the PATH by itself, and talks
+through the app's connection.
+
 Round 4 (2026-11-21): mute, scrubbing and now playing confirmed working. MRP subtitles
 broke audio (see Protocol notes) — reverted to Companion ToggleCaptions. No placeholder in
 the text bar; no hover text (tooltips) anywhere — keep it that way.
@@ -58,16 +64,22 @@ Privacy grants are keyed on bundle id + team, so they survive every rebuild.
 
 ### Live testing
 
-- `tvctl scan | pair <tv> | status | press [tv:] down select … | skip 10 | seek 1234 | np |
-  captions | text <s> | sleep | wake | airplay | mrp [s] | mute | mseek <s> | subs` shares the app's pairing store; use it to test protocol
-  changes without the UI. `tvctl status` prints the connect timings; `tvctl -v …` traces
-  every message. Exploration: `tvctl raw <_i> key=value…` (prints the reply) and
-  `tvctl listen <s> <event>… +<request>… !<button>…` (TVCTL_DUMP=dir writes every binary
-  plist received, decode with plistlib).
-- **The TV keeps one connection per pairing identity**: tvctl and the app share one, so
-  they kick each other off (the app then reconnects within 0.3 s and kicks tvctl). Quit
-  the app (`pkill -x RemoteTV`) while using tvctl; `open -g -a /Applications/RemoteTV.app`
-  after.
+- `tvctl` is on the PATH (`~/.local/bin/tvctl` → `RemoteTV.app/Contents/Helpers/tvctl`; the
+  app (re)creates the symlink at launch, `Commands.installCLI`). `tvctl help` lists commands:
+  status, np, press/hold, skip/seek, mute, captions, sleep/wake/power, text/type, launch,
+  apps, upnext, show/hide, sidebar, raw, snapshot. They run on the **app's** session via
+  its control socket (`ControlServer`: `~/Library/Application Support/RemoteTV/control.sock`,
+  0600; one line of U+001F-separated args, reply text + "\u{1F}<exit code>"), starting the
+  app in the background if needed. ~15 ms per command.
+- `tvctl direct …` uses tvctl's own connection for protocol work: `direct status` (connect
+  timings), `direct -v …` (traces every message), `direct raw <_i> k=v…`, `direct listen <s>
+  <event>… +<request>… !<button>…` (TVCTL_DUMP=dir writes every binary plist received),
+  `direct airplay | mrp [s] | mute | mseek <s>`; `scan` and `pair <tv>` are always direct
+  (pair tells the running app to reload). **The TV keeps one connection per pairing
+  identity**: a direct session kicks the app's off (the app reconnects in 0.3 s and kicks
+  it back), so `pkill -x RemoteTV` first and `open -g -a /Applications/RemoteTV.app` after.
+  TVCTL_FAKE_IDENTITY=1 makes a direct session use an identity the TV never paired (tests
+  the "pairing lost" path).
 - The app answers `remotetv://` URLs (`open -g "remotetv://…"`): `show`, `hide`,
   `press/<button>/…`, `skip/<s>`, `sleep`, `wake`, `pairing`, and the debug
   `snapshot?path=/abs/file.png[&controls=1][&appearance=dark|light|system]` (window content
@@ -98,7 +110,8 @@ Sources/RemoteCore/       protocol stack, no AppKit, unit-tested
   Media.swift             NowPlaying, TextSession, RTI text operations, ArchiveBuilder
   AirPlay.swift           HAPCipher, HAPStream, HTTPMessage, AirPlayTunnel (control/events/data)
   Protobuf.swift          hand-rolled protobuf writer/reader
-  MRP.swift               MediaRemote: MRP handshake, player state, seek, subtitles, mute
+  MRP.swift               MediaRemote: MRP handshake, player state, seek, artwork, mute
+  Library.swift           TV apps (with icons), Up Next items, deep links
   SRP.swift               SRP-6a client, 3072-bit group, SHA-512
   HAP.swift               PairSetup (M1–M6), PairVerify (M1–M4), Credentials, crypto helpers
   Connection.swift        NWConnection, framing, FrameCipher (ChaCha20-Poly1305)
@@ -113,6 +126,9 @@ Sources/RemoteTV/         the app (AppKit)
   ClickPad.swift          glass clickpad: wedges/center hit testing, trackpad swipe → touch
   Controls.swift          Theme, PressView (down/up), GlassButton, SplitPill, IconButton
   MediaKeys.swift         session event tap for NX_SYSDEFINED media keys (Accessibility)
+  Sidebar.swift           the slide-out panel: now-playing card, Up Next list, app grid, image loading
+  ControlServer.swift     tvctl's Unix socket
+  Commands.swift          tvctl commands on the app's session; installs the tvctl symlink
 Sources/TVCtl/            tvctl
 Tests/RemoteCoreTests/    codecs, bignum/SRP vectors (from Python), fake HAP accessory
 ```
@@ -224,8 +240,75 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
 - Info.plist NSBonjourServices must list every service type resolved (`_airplay._tcp`
   too): an undeclared type fails with NWError -65555 NoAuth in the app (tvctl, a CLI, isn't
   subject to it, so it hides the problem).
+- Library (TVRC, Companion): `FetchLaunchableApplicationsEvent` → `{bundleID: name}`; with
+  `IncludeAppMetadataKey`, `UsePNG`, `AppRangeStartingIndexKey`, `AppRangeCountKey` →
+  `{AppInfos: {bundleID: {LocalizedAppName, ImageKey (PNG, 5:3 tvOS icon), …}}, AppCountKey}`
+  (fetched one app per request to keep the TV's order). `FetchUpNextInfoEvent` →
+  `{UpNextInfosKey: [archived TVRCUpNextInfo]}` (actionURL deep link, service, reason,
+  progress, mediaInfo {title, seasonNumber, episodeNumber (int or real), imageURLTemplate
+  mzstatic {w}x{h}.{f}}); it sometimes fails with `AMSErrorDomain 301` for a while (the UI
+  keeps the last list). Play an item = `_launchApp {_urlS: actionURL}` (tv.apple.com
+  links open the TV app). Also seen, unused: FetchUserAccountsEvent/SwitchUserAccountEvent,
+  FetchSiriRemoteInfo (supportsFindMy; Find My needs a payload from the iPhone's Find My
+  stack), ToggleReduceLoudSounds, ToggleSystemAppearance, FetchCurrentTopShelfItemsEvent.
+- MRP artwork: PLAYBACK_QUEUE_REQUEST with artworkWidth 600, artworkHeight -1 → SetState
+  whose ContentItem.artworkData (3) is a JPEG (600×338, ~63 KB). Asked only while the
+  sidebar is open, once per item id.
 - Data-stream bug to not repeat: the frame type is at bytes 4–11 (after the size); a sync
   frame that isn't answered with a "rply" makes the TV stop sending.
+
+## Reliability (2026-11-21; keep all of these)
+
+- **Deaf sessions**: a TV can keep TCP up while its remote service stops answering (seen by
+  other clients after hours). `_hidC` presses and probes are tracked by xid; one unanswered
+  for 3 s drops the session, discards queued presses (never replay late) and the app
+  reconnects (0.3 s). `Remote.checkDeaf`.
+- **Probe on show**: when the window comes forward after ≥15 s of quiet, a cheap answered
+  request (`FetchMediaControlStatus`) finds a dead session before the user presses.
+- **Keepalive**: Companion NoOp frame (type 1, empty) every 30 s; TCP keepalive (10 s idle,
+  2×5 s) catches dead peers; AirPlay `POST /feedback` every 2 s and a 6 s
+  unanswered-request watchdog on the AirPlay control channel restarts the tunnel.
+- **Goodbye**: `_sessionStop {_srvT, _sid}` before quitting (applicationShouldTerminate →
+  terminateLater, ≤0.3 s), before Mac sleep, and when the hidden-window idle timer fires.
+  `_sid` is a UInt64 (remote << 32 | local): `OPACK.Writer.uint`.
+- **Network changes**: NWPathMonitor; a changed interface/gateway set → reconnect at once
+  (don't wait ~20 s for keepalive). Wake from sleep → fresh connection.
+- **Wake knock**: the TV's last address (UserDefaults `host.<name>`) gets brief TCP
+  connects on 49153/7000/3689/49152/32498 when it can't be reached (a sleeping Apple TV's
+  Bonjour sleep proxy wakes it); at most every 10 s.
+- **Pairing lost** (TV reset / removed under Remotes and Devices): pair-verify M2/M4 comes
+  back with an error TLV → `.unpaired`: no retry loop, the menu offers Pair Again.
+- **Renamed TV**: pairings are keyed by name; when the name can't be found and an unpaired
+  Apple TV is on the network, the stored credentials are tried on it (only the right TV can
+  complete pair-verify) and the pairing moves over (`AppDelegate.followRename`).
+- **Local Network denied**: detected (`NWPath.unsatisfiedReason == .localNetworkDenied`,
+  DNS -65570) → "Local Network access is off. Click to allow it." (opens the Privacy pane);
+  retries continue so it connects once allowed.
+- **Dimming**: `_iMC` flags (and FetchMediaControlStatus) say what the current app takes:
+  skip buttons dim without skip, the volume pill (and mute) without volume; the scrubber
+  hides when neither MRP seek nor skips work. Unknown until the TV says → nothing dims.
+  The TV acknowledges every press either way, so dimming is the only honest feedback.
+- **Input**: one-shot buttons (power, subtitles, mute) fire only if released over them;
+  held buttons always send the "up". Key repeats are ignored (the TV repeats a held
+  direction itself); held keys/clicks are released when the window loses focus. IME
+  composition isn't sent until committed. Long trackpad swipes lift and re-grip at the
+  virtual pad's edge (never a lift without motion, which would be a tap).
+
+### Other projects' bugs, checked (2026-11-21)
+
+Itsytv (66 issues), atv-desktop-remote, Clicker, alokdhir/appletv-remote, ribren/clicker,
+Raycast, Homebridge, Home Assistant. Handled: stale pairing loops; Keychain prompts (file
+store); rename/name collision (follow rename; pair-verify proves identity); key-repeat
+click bursts; stuck keys on focus loss; drag-off-then-release clicks; swipes captured off
+the pad; momentum swipes; non-ASCII text (UTF-16 bplist strings); pair-verify on a new
+connection after pair-setup (tvOS 27 hang); "Connecting…" forever after sleep/network
+change; volume confusion with CEC (dimming); HID skip keys that don't skip (`_mcc` skip);
+long-press that fell through as a click (real holds); YouTube ignoring MRP play/pause (we
+use HID); artwork request loops (asked once per item); Local Network denied; AirPlay
+access restricted (Companion keeps working; MRP retries quietly). Watch for (claimed by
+one project, not seen here): tvOS ignoring arrow `_hidC` while a `_touchStart` session is
+open — the owner uses both without problems on tvOS 27.2.1; the fix would be `_touchStop`
+before arrows.
 
 ## Performance notes (M4 Max, macOS 27.2.1, 2026-11-20)
 
@@ -243,6 +326,8 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
 
 ## Open work / ideas (owner hasn't asked for these; propose before big ones)
 
-- Artwork: `NowPlaying.artwork` (imageData) is parsed but not shown; it was null for the
-  one item seen.
-- App launcher (`FetchLaunchableApplicationsEvent`, `_launchApp`): `Remote.launch` exists.
+- Not yet seen live: playing an Up Next item (the TV's Up Next service returned
+  AMSErrorDomain 301 during the session that built it) and launching from the app grid
+  (same `_launchApp` as tvctl, which works).
+- Hold a skip button to fast-forward/rewind (`_mcc` 8–11 begin/end).
+- Reduce Loud Sounds toggle (one TVRC request); a sleep timer (sleep the TV in N minutes).

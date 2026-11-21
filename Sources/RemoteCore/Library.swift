@@ -101,11 +101,12 @@ extension Remote {
         }
     }
 
-    /// Continue-watching items, in the TV's order.
-    public func fetchUpNext(completion: @escaping @MainActor ([UpNextItem]) -> Void) {
+    /// Continue-watching items, in the TV's order; nil when the TV couldn't say (it
+    /// sometimes answers with an Apple Media Services error, e.g. AMSErrorDomain 301).
+    public func fetchUpNext(completion: @escaping @MainActor ([UpNextItem]?) -> Void) {
         raw("FetchUpNextInfoEvent", [:]) { reply, _ in
-            let items = reply?["_c"]?["UpNextInfosKey"]?.array?.compactMap { $0.data.flatMap(UpNextItem.init(archive:)) } ?? []
-            completion(items)
+            guard let reply else { return completion(nil) }
+            completion(reply["_c"]?["UpNextInfosKey"]?.array?.compactMap { $0.data.flatMap(UpNextItem.init(archive:)) } ?? [])
         }
     }
 

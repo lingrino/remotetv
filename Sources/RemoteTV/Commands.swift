@@ -23,6 +23,7 @@ extension AppDelegate {
       apps                    installed apps (bundle id, name)
       upnext                  continue-watching list
       show | hide             the RemoteTV window
+      sidebar [on|off|upnext|apps]  the sidebar (now playing, Up Next, apps)
       raw <_i> [k=v…]         any Companion request (debugging)
       snapshot <path.png>     window to PNG (debugging)
       direct <command>        talk to the TV over tvctl's own connection (kicks the app's)
@@ -47,6 +48,11 @@ extension AppDelegate {
             return ok("")
         case "hide":
             hide()
+            return ok("")
+        case "sidebar":
+            let a = rest.first
+            setSidebar(a.map { $0 != "off" && $0 != "close" } ?? !sidebarOpen, animate: true)
+            if a == "apps" { sidebarTab(1) } else if a == "upnext" { sidebarTab(0) }
             return ok("")
         case "snapshot":
             guard let path = rest.first else { return fail("usage: snapshot <path.png>") }
@@ -121,6 +127,7 @@ extension AppDelegate {
             }
         case "upnext":
             r.fetchUpNext { items in
+                guard let items else { return fail("the Apple TV couldn't list Up Next right now") }
                 ok(items.map { i in
                     [i.title, i.subtitle ?? "", i.service ?? "", i.reason ?? "", i.actionURL ?? ""].joined(separator: "\t")
                 }.joined(separator: "\n"))

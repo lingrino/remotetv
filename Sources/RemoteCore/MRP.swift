@@ -135,16 +135,38 @@ public final class MediaRemote {
     }
 
     /// Asks for the current item (the TV answers with a SetState carrying the queue).
-    public func refresh() {
+    public func refresh(artwork: Bool = false) {
         guard isReady else { return }
         tunnel.send(MediaRemote.message(type: MessageType.playbackQueueRequest, identifier: UUID().uuidString,
                                         ext: 37) { w in
             w.int(1, 0)          // location
             w.int(2, 1)          // length
             w.bool(3, true)      // includeMetadata
+            if artwork {
+                w.double(4, 600) // artworkWidth
+                w.double(5, -1)  // artworkHeight: keep the aspect ratio
+            }
             w.bool(9, true)      // includeLanguageOptions
             w.bool(13, true)     // returnContentItemAssetsInUserCompletion
         })
+    }
+
+    // MARK: - Artwork
+
+    /// Set while something shows artwork (the sidebar): each new item's artwork is asked
+    /// for once (an app without artwork must not cause a request loop).
+    public var wantsArtwork = false {
+        didSet { if wantsArtwork && !oldValue { publish(force: true) } }
+    }
+    private var artwork: [String: [UInt8]] = [:]
+    private var artworkAsked: Set<String> = []
+
+    private func keepArtwork(_ items: [ProtoMessage]) {
+        for item in items {
+            guard let id = item.string(1), let data = item.bytes(3), !data.isEmpty else { continue }
+            if artwork.count >= 4 { artwork.removeAll() }   // a handful of items at most
+            artwork[id] = data
+        }
     }
 
     // MARK: - Commands
@@ -245,6 +267,7 @@ public final class MediaRemote {
             if let st = s.int(6) { p.state = st }
             if let sc = s.message(2) { p.commands = sc.messages(1) }
             if let q = s.message(3) {
+                keepArtwork(q.messages(2))
                 if let onTrace {
                     for item in q.messages(2) where item.has(3) {
                         onTrace("  artwork \(item.bytes(3)?.count ?? 0) B \(item.int(13) ?? 0)x\(item.int(14) ?? 0) \(item.message(2)?.string(31) ?? "")")
@@ -312,9 +335,17 @@ public final class MediaRemote {
         return w.bytes
     }
 
-    private func publish() {
-        let np = activePlayer.flatMap(MediaRemote.nowPlaying(from:))
-        guard np != nowPlaying else { return }
+    private func publish(force: Bool = false) {
+        var np = activePlayer.flatMap(MediaRemote.nowPlaying(from:))
+        np?.bundleID = activeClient
+        if let id = np?.itemID {
+            np?.artwork = artwork[id]
+            if wantsArtwork && np?.artwork == nil && !artworkAsked.contains(id) {
+                artworkAsked.insert(id)
+                refresh(artwork: true)
+            }
+        }
+        guard force || np != nowPlaying else { return }
         nowPlaying = np
         onNowPlaying?(np)
     }
@@ -337,6 +368,7 @@ public final class MediaRemote {
                             rate: playing ? rate : 0, state: p.state)
         np.subtitle = md.string(63).flatMap { $0 == title ? nil : $0 } ?? md.string(2)
         np.bundleID = nil
+        np.itemID = item.string(1)
         // Subtitles: legible (type 1) options available / selected.
         let legibleAvailable = item.messages(5).contains { g in g.messages(3).contains { $0.int(1) == 1 } }
         np.hasCaptions = legibleAvailable
