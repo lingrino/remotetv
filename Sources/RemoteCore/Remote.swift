@@ -20,6 +20,11 @@ public enum Button: Int, Sendable, CaseIterable {
 }
 
 extension Button {
+    /// The buttons tvctl can press, under their one name each (`named` also takes
+    /// "ok", "back" and "tv"). Sleep and wake are `tvctl power`, not buttons.
+    public static let names = ["up", "down", "left", "right", "select", "menu", "home", "playpause", "volumeup", "volumedown",
+                               "siri", "screensaver", "guide", "pageup", "pagedown", "channelup", "channeldown"]
+
     /// Lowercase names for scripting ("playpause", "volumeup", "back" = menu, "tv" = home).
     public static func named(_ name: String) -> Button? {
         switch name.lowercased() {
@@ -32,7 +37,7 @@ extension Button {
         case "home", "tv": .home
         case "volumeup": .volumeUp
         case "volumedown": .volumeDown
-        case "playpause", "play", "pause": .playPause
+        case "playpause": .playPause   // not "play"/"pause": those are commands that don't toggle
         case "siri": .siri
         case "screensaver": .screensaver
         case "guide": .guide
@@ -159,6 +164,10 @@ public final class Remote {
     var timeout: DispatchWorkItem?
     var sid: UInt64 = 0
     var started = ContinuousClock.now
+    /// When the current session came up, and the handshake requests whose answers carry
+    /// state (text session, power) that haven't been answered yet: see `knows`.
+    var sessionAt = ContinuousClock.now
+    var stateXids: Set<Int> = []
 
     // Liveness (see "Reliability" below).
     var awaiting: [Int: ContinuousClock.Instant] = [:]
@@ -175,8 +184,16 @@ public final class Remote {
     public init(device: Device, credentials: Credentials?) {
         self.device = device
         self.credentials = credentials
-        if let h = UserDefaults.standard.string(forKey: "host.\(device.name)") { lastHost = NWEndpoint.Host(h) }
+        if let h = Remote.defaults.string(forKey: "host.\(device.name)") { lastHost = NWEndpoint.Host(h) }
     }
+
+    /// The app's preferences, from tvctl too: where the TV was last reached (the wake
+    /// knock) is worth knowing whichever of the two connected last.
+    static let defaults: UserDefaults = {
+        let app = "com.lingrino.remotetv"
+        if Bundle.main.bundleIdentifier == app { return .standard }
+        return UserDefaults(suiteName: app) ?? .standard
+    }()
 
     public var isPaired: Bool { credentials != nil }
 
@@ -280,6 +297,7 @@ public final class Remote {
         conn = nil
         phase = .idle
         replies.removeAll()
+        stateXids.removeAll()
         // Requests sent on this connection will never be answered now.
         let lost = rawReplies.values
         rawReplies.removeAll()
@@ -408,6 +426,7 @@ public final class Remote {
     func startSession() {
         timeout?.cancel()
         phase = .session
+        sessionAt = .now
         let local = UInt64.random(in: 1...UInt64(UInt32.max))
         let creds = credentials!
         let id = String(decoding: creds.clientID, as: UTF8.self)
@@ -442,26 +461,28 @@ public final class Remote {
         }
         // Text input: the reply carries the session if a text field is already focused
         // (then no _tiStarted follows).
-        request("_tiStart", count: 0, { _ in }) { [weak self] reply in
+        let state: (Int) -> Void = { [weak self] x in self?.stateXids.insert(x) }
+        send("_tiStart", type: 2, count: 0, { _ in }, reply: { [weak self] reply in
             self?.setTextSession(reply["_c"]?["_tiD"]?.data.flatMap(TextSession.init(archive:)))
-        }
+        }, registered: state)
         event("_interest", count: 1) { w in
             let events = ["_iMC", "SystemStatus", "TVSystemStatus", "_tiStarted", "_tiStopped", "NowPlayingInfo"]
             w.string("_regEvents"); w.array(events.count)
             for e in events { w.string(e) }
         }
-        request("FetchAttentionState", count: 0, { _ in }) { [weak self] reply in
+        send("FetchAttentionState", type: 2, count: 0, { _ in }, reply: { [weak self] reply in
             if let s = reply["_c"]?["state"]?.int { self?.systemStatus(s) }
-        }
+        }, registered: state)
         // The answer comes as a NowPlayingInfo event.
         request("FetchCurrentNowPlayingInfoEvent", count: 0) { _ in }
         status = .connected
         onTiming?("session", ContinuousClock.now - started)
         lastAnswer = .now
         failStreak = 0
-        if let h = conn?.remoteHost {
+        // Only a TV found by name has an address worth remembering (tests connect to one).
+        if case .service = device.endpoint, let h = conn?.remoteHost {
             lastHost = h
-            UserDefaults.standard.set("\(h)", forKey: "host.\(device.name)")
+            Remote.defaults.set("\(h)", forKey: "host.\(device.name)")
         }
         let k = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.conn?.send(.noOp, []) }
@@ -486,11 +507,7 @@ public final class Remote {
             case "SystemStatus", "TVSystemStatus":
                 if let s = content?["state"]?.int { systemStatus(s) }
             case "_iMC":
-                if let f = content?["_mcF"]?.int, Int(f) != controls.rawValue || !controlsKnown {
-                    controls = MediaControls(rawValue: Int(f))
-                    controlsKnown = true
-                    onControls?(controls)
-                }
+                if let f = content?["_mcF"]?.int { setControls(Int(f)) }
             case "NowPlayingInfo":
                 companionPlaying = content?["NowPlayingInfoKey"]?.data.flatMap(NowPlaying.init(archive:))
                 publishNowPlaying()
@@ -504,6 +521,7 @@ public final class Remote {
         case 3:   // response
             guard let x = msg["_x"]?.int else { return }
             awaiting.removeValue(forKey: Int(x))
+            stateXids.remove(Int(x))
             lastAnswer = .now
             let handler = replies.removeValue(forKey: Int(x))
             // Errors: `_em` (message) and/or `_ec`/`_ed` (code, domain; -6714 = not handled).
@@ -526,6 +544,21 @@ public final class Remote {
         guard s != textSession else { return }
         textSession = s
         onTextSession?(s)
+    }
+
+    /// The TV's media-control flags changed, or were said for the first time.
+    func setControls(_ flags: Int) {
+        guard flags != controls.rawValue || !controlsKnown else { return }
+        controls = MediaControls(rawValue: flags)
+        controlsKnown = true
+        onControls?(controls)
+    }
+
+    /// A FetchMediaControlStatus answer: taken when it differs from what's held (an answer
+    /// equal to the initial "none" doesn't make the flags known; the `_iMC` event does).
+    func controlsAnswer(_ reply: OPACK.Value?) {
+        guard let f = reply?["_c"]?["MediaControlFlags"]?.int, Int(f) != controls.rawValue else { return }
+        setControls(Int(f))
     }
 
     func systemStatus(_ s: Int64) {
@@ -594,6 +627,10 @@ public final class Remote {
     var mediaRetry: DispatchWorkItem?
 
     var mediaFailures = 0
+
+    /// This session's AirPlay link: when MRP became ready, and whether it has failed (`knows`).
+    var mediaReadyAt: ContinuousClock.Instant?
+    var linkFailed = false
 
     var companionPlaying: NowPlaying?
 

@@ -28,6 +28,15 @@ public struct NowPlaying: Sendable, Equatable {
 
     public var isPlaying: Bool { state == 1 && rate != 0 }
 
+    /// A position or length in seconds as 0:07 · 12:34 · 1:02:03.
+    public static func clock(_ seconds: Double) -> String {
+        let t = seconds.isFinite ? Int(min(1e7, max(0, seconds)).rounded(.down)) : 0
+        let h = t / 3600, m = t / 60 % 60, s = t % 60
+        let ss = s < 10 ? "0\(s)" : "\(s)"
+        if h > 0 { return "\(h):\(m < 10 ? "0\(m)" : "\(m)"):\(ss)" }
+        return "\(m):\(ss)"
+    }
+
     /// Times from the TV are trusted only when finite and plausible (0…~4 months); NaN or
     /// infinity would crash any Int conversion downstream.
     static func seconds(_ d: Double?) -> Double? {

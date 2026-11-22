@@ -55,6 +55,14 @@ public struct CredentialStore: Sendable {
         return entries.first { $0.name == k }?.credentials
     }
 
+    /// The paired TV meant by `name`: as stored, or the one that differs only in case.
+    public func name(matching name: String) -> String? {
+        let k = CredentialStore.key(name)
+        if entries.contains(where: { $0.name == k }) { return k }
+        let found = entries.filter { $0.name.lowercased() == k.lowercased() }
+        return found.count == 1 ? found[0].name : nil
+    }
+
     /// The most recently used Apple TV.
     public var last: String? { entries.first?.name }
 

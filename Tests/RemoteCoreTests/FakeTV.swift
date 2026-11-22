@@ -17,6 +17,8 @@ final class FakeTV {
     private(set) var received: [OPACK.Value] = []
     /// Answer requests (`_t` 2)? Per identifier: false = stay silent.
     var answers: [String: Bool] = [:]
+    /// What an answer carries (`_c`), per identifier; empty unless set.
+    var contents: [String: OPACK.Value] = [:]
     /// Sent right after accepting, before pair-verify: an injection attempt.
     var preAuthFrame: (FrameType, [UInt8])?
     /// Pair-verify M2 is this error TLV instead (2 = the pairing is unknown).
@@ -135,7 +137,7 @@ final class FakeTV {
         case .encryptedOPACK:
             received.append(msg)
             if msg["_t"]?.int == 2, let id = msg["_i"]?.string, answers[id] ?? true, let x = msg["_x"]?.int {
-                send(.dict(["_t": .int(3), "_x": .int(x), "_c": .dict([:])]))
+                send(.dict(["_t": .int(3), "_x": .int(x), "_c": contents[id] ?? .dict([:])]))
             }
         default:
             break

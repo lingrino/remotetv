@@ -26,6 +26,11 @@ final class ControlServer: @unchecked Sendable {
         guard var addr = UnixSocket.address(path) else {
             return log.error("control socket path too long: \(path, privacy: .private)")
         }
+        // A client that hangs up before its answer is written (tvctl interrupted, a bare
+        // connect) must not take the app down: SO_NOSIGPIPE below can't be set on a socket
+        // whose peer has already closed, and an unhandled SIGPIPE ends the process without
+        // a trace. Nothing in the app wants the signal: writes report EPIPE instead.
+        signal(SIGPIPE, SIG_IGN)
         unlink(path)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return log.error("control socket: socket() failed \(errno)") }
@@ -39,7 +44,7 @@ final class ControlServer: @unchecked Sendable {
             close(fd)
             return log.error("control socket: bind failed \(errno)")
         }
-        listen(fd, 8)
+        listen(fd, 128)   // a refused connect reads as "the app isn't running" to tvctl: leave room for a burst
         let t = Thread { [self] in
             while true {
                 let c = accept(fd, nil, nil)

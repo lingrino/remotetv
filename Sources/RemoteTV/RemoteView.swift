@@ -231,8 +231,8 @@ final class NowPlayingStrip: NSView {
     }
 
     private func setTimes(_ p: Double, _ d: Double) {
-        elapsed.stringValue = NowPlayingStrip.clock(p)
-        remaining.stringValue = "-" + NowPlayingStrip.clock(max(0, d - p))
+        elapsed.stringValue = NowPlaying.clock(p)
+        remaining.stringValue = "-" + NowPlaying.clock(max(0, d - p))
     }
 
     @objc private func slid() {
@@ -240,15 +240,6 @@ final class NowPlayingStrip: NSView {
         scrubbing = type == .leftMouseDown || type == .leftMouseDragged
         setTimes(slider.doubleValue, slider.maxValue)
         if !scrubbing { onSeek?(slider.doubleValue) }
-    }
-
-    /// 0:07 · 12:34 · 1:02:03
-    static func clock(_ seconds: Double) -> String {
-        let t = seconds.isFinite ? Int(min(1e7, max(0, seconds)).rounded(.down)) : 0
-        let h = t / 3600, m = t / 60 % 60, s = t % 60
-        let ss = s < 10 ? "0\(s)" : "\(s)"
-        if h > 0 { return "\(h):\(m < 10 ? "0\(m)" : "\(m)"):\(ss)" }
-        return "\(m):\(ss)"
     }
 }
 
