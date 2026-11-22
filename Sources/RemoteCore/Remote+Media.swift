@@ -15,9 +15,12 @@ extension Remote {
         let m = MediaRemote(device: device, credentials: credentials, name: clientName)
         m.wantsArtwork = wantsArtwork
         media = m
+        mediaReadyAt = nil
+        linkFailed = false
         m.onReady = { [weak self, weak m] ok in
             guard let self, let m, m === self.media else { return }
             if ok { self.mediaFailures = 0 }
+            self.mediaReadyAt = ok ? .now : nil
             Remote.log.info("\(self.device.name, privacy: .public): MRP \(ok ? "ready" : "down", privacy: .public)")
             self.onMediaReady?(ok)
             self.publishNowPlaying()
@@ -29,6 +32,7 @@ extension Remote {
         m.onTunnel = { [weak self, weak m] s in
             guard let self, let m, m === self.media, case .failed(let e) = s else { return }
             Remote.log.notice("AirPlay tunnel: \(e, privacy: .public)")
+            self.linkFailed = true
             self.scheduleMediaRetry()
         }
         m.start()

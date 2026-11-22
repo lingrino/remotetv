@@ -46,12 +46,7 @@ extension Remote {
         switch phase {
         case .session:
             guard force || ContinuousClock.now - lastAnswer > .seconds(15) else { return }
-            request("FetchMediaControlStatus", count: 0, { _ in }) { [weak self] reply in
-                guard let self, let f = reply["_c"]?["MediaControlFlags"]?.int, Int(f) != self.controls.rawValue else { return }
-                self.controls = MediaControls(rawValue: Int(f))
-                self.controlsKnown = true
-                self.onControls?(self.controls)
-            }
+            request("FetchMediaControlStatus", count: 0, { _ in }) { [weak self] reply in self?.controlsAnswer(reply) }
         case .idle:
             if isPaired { connect() }
         default:

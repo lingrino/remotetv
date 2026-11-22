@@ -23,6 +23,18 @@ This file is the agent guide (Claude Code reads it when there is no CLAUDE.md; d
 - Local git repo at first, then GitHub (lingrino/remotetv), released through the
   owner's Homebrew tap like fred and peep (see CI and releases).
 
+Round 9 (2026-11-22): tvctl is a first-class interface to the product, for people and for
+other agents, not a debugging aid: "nice help text, a logical and coherent command
+structure, and coverage over the features that exist in the app". See "tvctl" below for
+what that means in the code. Done in the same change as round 8.
+
+Round 8 (2026-11-22): tvctl works without the app. Asked whether to connect per command or
+to keep a background service that both the app and tvctl talk to, the owner chose the
+per-command connection: connecting is ~37 ms, while a service would put IPC between the
+window and every press, need launchd registration and upgrade restarts, and hold the TV's
+one connection all day. A short-lived helper that lingers between commands (repeat
+commands in ~15 ms) was the offered next step if scripts ever send bursts; not built.
+
 Round 7 (2026-11-21): published. Public GitHub repo (lingrino/remotetv); repo, ruleset,
 secrets and secret scanning are Terraform in lingrino/infra (#3043–#3046), in autotouch's
 order (private first, branch resources after the first push, public, then secret
@@ -30,7 +42,7 @@ scanning). CI and releases copied from autotouch/fred; every merge publishes
 `Casks/remotetv.rb` in lingrino/homebrew-tap, and lingrino/dotfiles installs it on the
 personal Mac and the mini. README: the owner's text plus `docs/remote.png` (the real
 window, dark mode, sidebar closed, nothing playing: `screencapture -l <window id>` with
-RemoteTV frontmost; `tvctl snapshot` can't render Liquid Glass). No AI attribution in
+RemoteTV frontmost; `tvctl debug snapshot` can't render Liquid Glass). No AI attribution in
 commits or PRs, ever.
 
 Round 6 (2026-11-20): an independent full review (another model, all files) before going
@@ -111,23 +123,29 @@ Privacy grants are keyed on bundle id + team, so they survive every rebuild.
 ### Live testing
 
 - `tvctl` is on the PATH (`~/.local/bin/tvctl` → `RemoteTV.app/Contents/Helpers/tvctl`; the
-  app (re)creates the symlink at launch, `Commands.installCLI`). `tvctl help` lists commands:
-  status, np, press/hold, skip/seek, mute, captions, sleep/wake/power, text/type, launch,
-  apps, upnext, show/hide, sidebar, raw, snapshot. They run on the **app's** session via
-  its control socket (`ControlServer`: `~/Library/Application Support/RemoteTV/control.sock`,
-  0600; one line of U+001F-separated args, reply text + "\u{1F}<exit code>"), starting the
-  app in the background if needed. ~15 ms per command.
-- `tvctl direct …` uses tvctl's own connection for protocol work: `direct status` (connect
-  timings), `direct -v …` (traces every message), `direct raw <_i> k=v…`, `direct listen <s>
+  app (re)creates the symlink at launch, `Commands.installCLI`). `tvctl help` is its
+  manual (see "tvctl" below). **The TV keeps one connection per pairing identity**, so one
+  process talks to it at a time:
+  - App running: commands run on the **app's** session via its control socket
+    (`ControlServer`: `~/Library/Application Support/RemoteTV/control.sock`, 0600; one line
+    of U+001F-separated args, reply text + "\u{1F}<exit code>"). ~15 ms per command.
+  - App not running: tvctl connects itself, runs the one command, and leaves (`oneShot` in
+    `Sources/TVCtl/main.swift`; see Reliability). The app is **not** started. Only `show`
+    and `sidebar` (and `debug snapshot`) start it (in the background, ~0.4 s).
+  - Either way the commands are the same code: `TVCommand` (RemoteCore).
+- Protocol work: `tvctl help debug`. `tvctl debug raw <request> k=v…` (any Companion
+  request; through the app when it runs), `debug event <name> k=v…`, `debug listen <s>
   <event>… +<request>… !<button>…` (TVCTL_DUMP=dir writes every binary plist received),
-  `direct airplay | mrp [s] | mute | mseek <s>`; `scan` and `pair <tv>` are always direct
-  (pair tells the running app to reload). **The TV keeps one connection per pairing
-  identity**: a direct session kicks the app's off (the app reconnects in 0.3 s and kicks
-  it back), so `pkill -x RemoteTV` first and `open -g -a /Applications/RemoteTV.app` after.
-  TVCTL_FAKE_IDENTITY=1 makes a direct session use an identity the TV never paired (tests
-  the "pairing lost" path).
-- `tvctl snapshot <file.png> [dark|light] [controls]` writes the window (with the sidebar)
-  to a PNG; Liquid Glass doesn't render offscreen, layout and symbols do.
+  `debug airplay`, `debug mrp [s] | mrp mute | mrp seek <s>` (the AirPlay link alone, no
+  Companion session). `--direct` makes any command use tvctl's own connection even while
+  the app runs and prints the connect timings (`tvctl --direct status`); `-v` also traces
+  every message (both to stderr). `--tv <name>` picks another paired TV. A direct session
+  kicks a running app's off (the app reconnects in 0.3 s and kicks it back), so `pkill -x
+  RemoteTV` first and `open -g -a /Applications/RemoteTV.app` after; with the app quit,
+  every command is a direct session anyway. TVCTL_FAKE_IDENTITY=1 makes tvctl's own
+  session use an identity the TV never paired (tests the "pairing lost" path).
+- `tvctl debug snapshot <file.png> [dark|light] [controls]` writes the window (with the
+  sidebar) to a PNG; Liquid Glass doesn't render offscreen, layout and symbols do.
 - `remotetv://` URLs only do `show`, `hide`, `sidebar`: any web page or app can open a URL,
   so nothing that touches the TV or the disk may ever be added to the scheme.
 - Logs: `/usr/bin/log show --last 5m --predicate 'subsystem == "com.lingrino.remotetv"' --info --debug`
@@ -136,6 +154,44 @@ Privacy grants are keyed on bundle id + team, so they survive every rebuild.
 - Etiquette: the TV is the owner's. Commands that change what's on screen (press, sleep)
   only when the owner asked or is clearly away from the TV; pairing makes a PIN appear on
   the TV (cancel it if unused). `open` without `-g` steals focus: avoid while the owner works.
+
+## tvctl (a product interface: keep it one)
+
+`tvctl help` must be enough for a person or an agent who has never seen it. What that
+rests on:
+
+- **One name, one meaning.** Commands are grouped as the help lists them: Remote (press,
+  hold), Playback (playing, play, pause, playpause, skip, seek, volume, mute, captions),
+  Text (type, text), Apps (apps, launch, upnext), Apple TV (status, power, tvs, use, scan,
+  pair, forget), RemoteTV window (show, hide, sidebar). A bare noun reads (`power`,
+  `text`, `playing`), an argument acts (`power off`, `text "…"`). Where the TV reports
+  state, the command for a state is safe to repeat (`play`, `pause`, `captions on`,
+  `power on`) and says so in `changed`; where it doesn't (mute over HDMI-CEC), there is
+  only a toggle and the help says why. Old names stay as aliases (`np`, `wake`, `sleep`,
+  `subtitles`; `Invocation.aliases`), not as second commands.
+- **Adding a command** = an entry in `TVCommand.Help.entries` (usage, summary, detail,
+  examples), a line in `Help.overview`, and its case in `TVCommand.parse` (acts on the TV)
+  or in tvctl's `main` / the app's `command` (doesn't). `CLITests` fails when the three
+  disagree, when help is wider than 80 columns, or when a button is missing from the help.
+- **Options** work anywhere before a `--`: `--tv <name>`, `--json`, `-h/--help`,
+  `--version` (and `--direct`, `-v` for debugging). tvctl hands the app the same command
+  line in a form that parses back identically (`Invocation.wire`).
+- **Output.** Text is for people and may be reworded. `--json` is the contract: one object
+  on one line on stdout, `{"ok":true,…}` or `{"ok":false,"error":"…"}`, snake_case keys,
+  seconds as numbers, unknown as null. Add fields; don't rename or remove them. Without
+  `--json`, results go to stdout and failures to stderr. Prompts (the pairing PIN) and
+  debug output (timings, traces) go to stderr.
+- **Exit status**: 0 worked, 1 failed (TV unreachable, nothing playing, no such app), 2
+  not understood (unknown command, bad argument; the reply ends with the usage line).
+  A command line is checked before anything connects. 75 is internal (the app telling
+  tvctl that `--tv` names a TV it isn't controlling: tvctl then connects to that one).
+- **Honest results**: `launch` checks the name against the TV's app list instead of
+  sending a bundle id into the void; a command the TV didn't confirm exits 1.
+- **Protocol tools live under `tvctl debug`** and stay out of `tvctl help`.
+- **Not covered, on purpose**: trackpad swipes (the arrows do the same moves), artwork and
+  app icons (pictures for the window), the media-key tap. Everything else the window does
+  has a command: switching and forgetting TVs (`use`, `forget`: the TV menu), playing an
+  Up Next item, launching from the app grid.
 
 ## Privacy grants (user-only)
 
@@ -162,9 +218,12 @@ Sources/RemoteCore/       protocol stack, no AppKit, unit-tested (release builds
   HAP.swift               PairSetup (M1–M6), PairVerify (M1–M4), Credentials, crypto helpers
   Connection.swift        NWConnection, framing, FrameCipher (ChaCha20-Poly1305)
   Remote.swift            session state machine: connect, pair-verify, pairing, handshake, events
-  Remote+Commands.swift   buttons, playback, text, power, apps, touch, raw requests (Waiter)
-  Remote+Reliability.swift deaf watchdog, probe, reconnect, goodbye, wake knock
-  Remote+Media.swift      the AirPlay/MRP tunnel's lifecycle and the now-playing merge
+  Remote+Commands.swift   buttons, playback, text, power, apps, touch, raw requests (Waiter);
+                          knows/flush for a session made for one command
+  TVCommand.swift         tvctl: reading the command line (Invocation), a command's result
+                          (text + JSON + exit status), the commands that act on the TV
+  TVCommand+Help.swift    tvctl's words: the command list, each command's help, "did you mean"
+  JSON.swift              a JSON value, written on one line in the order listed (--json)
   UnixSocket.swift        sockaddr_un helper (control socket; app and tvctl)
   Discovery.swift         Device, Browser (_companion-link._tcp, AppleTV* only)
   CredentialStore.swift   ~/Library/Application Support/RemoteTV/pairings.tsv (0600)
@@ -182,12 +241,15 @@ Sources/RemoteTV/         the app (AppKit)
   MediaKeys.swift         session event tap for NX_SYSDEFINED media keys (Accessibility)
   Sidebar.swift           the slide-out panel: now-playing card, Up Next list, app grid, image loading
   ControlServer.swift     tvctl's Unix socket
-  Commands.swift          tvctl commands on the app's session; installs the tvctl symlink
+  Commands.swift          tvctl's commands about the app (window, which TV); TV commands →
+                          TVCommand on the app's session; installs the tvctl symlink
   BundleWatcher.swift     restarts into a new version installed over this one (brew upgrade)
-Sources/TVCtl/            tvctl
+Sources/TVCtl/            tvctl: options and help, the pairings (tvs, scan, pair, use, forget),
+                          through the app's socket or its own connection (oneShot), debug tools
 Tests/RemoteCoreTests/    codecs, bignum/SRP vectors (from Python), fake HAP accessory,
                           FakeTV (loopback Apple TV: framing, pair-verify, encryption) +
-                          SessionTests (Remote's state machine, liveness, trust boundary)
+                          SessionTests (Remote's state machine, liveness, trust boundary),
+                          CommandTests (commands against FakeTV), CLITests (arguments, help, JSON)
 ```
 
 Threading: Remote, Connection, the AirPlay tunnel and all NW callbacks run on the main
@@ -329,7 +391,7 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
 - **Probe on show**: when the window comes forward after ≥15 s of quiet, a cheap answered
   request (`FetchMediaControlStatus`) finds a dead session before the user presses. A
   network change forces the same probe (instead of a reconnect).
-- **Every request completes**: `raw` requests (apps, Up Next, tvctl raw) get their reply,
+- **Every request completes**: `raw` requests (apps, Up Next, tvctl debug raw) get their reply,
   (nil, error), "disconnected" when the connection ends, or "timed out" after 5 s
   (`Remote.Waiter`) — never a hang (the sidebar once sat on "Loading…" forever).
 - **Queued presses expire**: commands made while connecting run only if ≤2 s old when the
@@ -347,7 +409,8 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
   `_sid` is a UInt64 (remote << 32 | local): `OPACK.Writer.uint`.
 - **Network changes**: NWPathMonitor; a changed interface/gateway set → reconnect at once
   (don't wait ~20 s for keepalive). Wake from sleep → fresh connection.
-- **Wake knock**: the TV's last address (UserDefaults `host.<name>`) gets brief TCP
+- **Wake knock**: the TV's last address (UserDefaults `host.<name>`, the app's domain,
+  read and written by tvctl too: `Remote.defaults`) gets brief TCP
   connects on 49153/7000/3689/49152/32498 when it can't be reached (a sleeping Apple TV's
   Bonjour sleep proxy wakes it); at most every 10 s and only for the first 3 failures (away
   from home the address belongs to someone else's network).
@@ -371,6 +434,27 @@ Rapport media-control keys (`_mcF`, `_mcs`, `_skpS`, `_vol`).
   direction itself); held keys/clicks are released when the window loses focus, when focus
   moves into the text bar, and when ⌘ goes down (AppKit sends no key-up for a key released
   while ⌘ is held). Media keys pass through to the Mac when the TV isn't connected.
+- **tvctl without the app** (`oneShot`, `TVCommand.run`): the command is parsed first (a
+  typo never connects). Connecting retries a failed attempt (0.3 s, 1 s, 2 s, 4 s) for up
+  to 10 s: one full attempt (8 s), whose failure knocks, and a retry; a lost pairing or
+  Local Network denied ends it at once. `.connected` only means the handshake was *sent*,
+  so a command waits for what it reads (`Remote.knows`): `power` and `text`/`type` for the
+  handshake answers (≤1 s), `mute` for the AirPlay link (until it is up or has failed,
+  ≤2 s), `np`/`status`/`seek` for now playing (250 ms after MRP is ready when nothing
+  plays). The app's session passes all of these instantly; they also fix the app's
+  reconnect-on-demand after its idle timeout (`np` said "nothing playing", `power` could
+  toggle the wrong way). Then `Remote.flush`: an answered request sent behind everything
+  else proves the TV read it all, and MRP frames are acknowledged one by one ("rply",
+  `MediaRemote.unacknowledged`), ≤1 s; unanswered = exit 1 "didn't confirm". Then the goodbye
+  and exit. No fixed waits anywhere: don't add one. One at a time: `flock` on
+  `tvctl.lock` next to the pairings (parallel tvctls would kick each other off the TV);
+  after getting the lock tvctl looks for the app's socket again. The app launching
+  mid-command takes the connection: that command fails, the next goes through the app.
+- **A client that hangs up** before its answer is written (tvctl interrupted, a bare
+  connect to the socket) used to end the app with SIGPIPE, silently: `SO_NOSIGPIPE` can't
+  be set on a socket whose peer already closed. The app ignores SIGPIPE
+  (`ControlServer.start`). The listen queue is 128: to tvctl a refused connect means "the
+  app isn't running", and it would connect itself and take the app's session.
 - **Hidden** (closed, ⌘H, `tvctl hide`): ticker, artwork and Bonjour browsing stop; the
   session ends after 10 min (re-armed by tvctl commands, which reconnect on demand).
 - Failures are typed (`Status.failed(ProtocolError)`): behavior never depends on the
@@ -422,7 +506,21 @@ before arrows.
   mDNS run in parallel with AppKit startup. TCP connect to the TV measured 12–17 ms.
 - TCP_NODELAY on: a click is two tiny frames back to back.
 
+- tvctl without the app: not timed against the TV yet (it wasn't reachable on 2026-11-22).
+  Against FakeTV on loopback, connect + press + flush + goodbye is 19 ms, so live it should
+  be the ~37 ms connect plus a round trip; mute/np/seek add the AirPlay link (~130 ms).
+  For comparison, starting the app (what tvctl did before) took 0.43 s for a `snapshot`.
+
 ## Open work / ideas (owner hasn't asked for these; propose before big ones)
+
+- Live checks owed for tvctl without the app (built with the TV out of reach; FakeTV tests
+  cover the Companion side only): `time tvctl press …`, `playing` with something on and
+  idle, `play`/`pause`, `mute`, `seek`, `type`/`text`, `power on|off`, `launch <name>`,
+  `upnext <n>` with the app quit. Confirm the TV sends a "rply" for every
+  MRP frame of ours (`tvctl -v debug mrp`; if it sends none at all, `flush` doesn't wait
+  for them, and `mute`/`seek` leave without that proof). Check tvctl
+  started by another app (Fred, a launchd job): macOS may ask *that* app for Local Network
+  access; from a terminal tvctl is exempt.
 
 - Not yet seen live: playing an Up Next item and launching from the app grid (the same
   `_launchApp` tvctl uses, which works).

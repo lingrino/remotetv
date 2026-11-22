@@ -38,6 +38,11 @@ public final class MediaRemote {
 
     public var tunnelState: AirPlayTunnel.State { tunnel.state }
 
+    /// Messages the TV hasn't acknowledged yet: zero means it has everything we sent
+    /// (`Remote.flush`). A TV that got through the handshake without acknowledging a single
+    /// frame doesn't acknowledge frames at all; then there is nothing to wait for.
+    public var unacknowledged: Int { isReady && tunnel.acks == 0 ? 0 : tunnel.unacked }
+
     public func start() { tunnel.connect() }
 
     public func stop() {

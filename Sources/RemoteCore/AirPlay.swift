@@ -260,6 +260,11 @@ public final class AirPlayTunnel {
     private let sendSeqno = UInt64.random(in: 0x1_0000_0000..<0x1_FFFF_FFFF)
     private var feedback: Timer?
     private var timeout: DispatchWorkItem?
+    /// Messages sent that the TV hasn't acknowledged yet (it answers each of our "sync"
+    /// frames with a "rply"), and how many it has acknowledged on this connection: see
+    /// `MediaRemote.unacknowledged`.
+    private(set) var unacked = 0
+    private(set) var acks = 0
 
     public init(device: Device, credentials: Credentials) {
         self.device = device
@@ -301,6 +306,7 @@ public final class AirPlayTunnel {
         payload += message
         let plist = Plist.dict([("params", .dict([("data", .data(payload))]))]).encode()
         data.send(AirPlayTunnel.frame(type: "sync", command: "comm", seqno: sendSeqno, payload: plist))
+        unacked += 1
         onTrace?("→ data frame \(plist.count + 32) B (message \(message.count) B)")
     }
 
@@ -313,6 +319,8 @@ public final class AirPlayTunnel {
         controlBuffer.removeAll(); eventBuffer.removeAll(); dataBuffer.removeAll()
         waiting.removeAll()
         waitingSince.removeAll()
+        unacked = 0
+        acks = 0
     }
 
     func fail(_ e: ProtocolError) {
@@ -508,12 +516,17 @@ public final class AirPlayTunnel {
             guard size >= 32, size < 1 << 24 else { return fail(.malformed("data stream frame size")) }
             guard dataBuffer.count >= size else { break }
             let isSync = dataBuffer[4..<8].elementsEqual("sync".utf8)   // type follows the 4-byte size
+            let isReply = dataBuffer[4..<8].elementsEqual("rply".utf8)
             var seqno: UInt64 = 0
             for i in 20..<28 { seqno = seqno << 8 | UInt64(dataBuffer[i]) }
             let payload = Array(dataBuffer[32..<size])
             dataBuffer.removeFirst(size)
-            onTrace?("← data frame \(isSync ? "sync" : "other") \(size) B")
+            onTrace?("← data frame \(isSync ? "sync" : isReply ? "rply" : "other") \(size) B")
             if isSync { data?.send(AirPlayTunnel.frame(type: "rply", command: nil, seqno: seqno, payload: [])) }
+            if isReply {
+                acks += 1
+                if unacked > 0 { unacked -= 1 }
+            }
             if !payload.isEmpty, onTrace != nil { onTrace?("  payload \((try? Plist.decode(payload)).map { "\($0)" }?.prefix(300) ?? "not a plist")") }
             guard !payload.isEmpty, let p = try? Plist.decode(payload), let blob = p["params"]?["data"]?.data else { continue }
             var i = 0

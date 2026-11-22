@@ -181,6 +181,67 @@ extension Remote {
         }
     }
 
+    // MARK: - Connect, act, leave (tvctl without the app)
+
+    /// What a command may need to have heard from the TV before it runs. Each level
+    /// includes the ones before it.
+    public enum Knowledge: Sendable {
+        /// The session is up: buttons, skips, launches, requests.
+        case session
+        /// The handshake's answers are in: power state, the focused text field.
+        case state
+        /// The AirPlay link is up (mute), or won't be.
+        case link
+        /// What's playing is known (or nothing is).
+        case playing
+    }
+
+    /// How long `knows` waits for each kind of answer before going with what there is.
+    static var knowledgeWait: (state: Duration, link: Duration, playing: Duration) =
+        (.seconds(1), .seconds(2), .milliseconds(250))
+
+    /// Whether the session has heard that much. `.connected` only means the handshake was
+    /// sent: its answers, the AirPlay link (~130 ms) and the first now-playing state follow.
+    /// A session that has been up for a while knows everything; one made for a single
+    /// command has to wait for what that command reads. Every wait is bounded
+    /// (`knowledgeWait`): a TV that doesn't say counts as nothing to know.
+    public func knows(_ k: Knowledge) -> Bool {
+        guard case .session = phase else { return false }
+        if k == .session { return true }
+        let age = ContinuousClock.now - sessionAt
+        guard stateXids.isEmpty || age > Remote.knowledgeWait.state else { return false }
+        if k == .state { return true }
+        guard let m = media else { return true }   // a TV reached by address has no AirPlay link
+        guard m.isReady, let since = mediaReadyAt else { return linkFailed || age > Remote.knowledgeWait.link }
+        if k == .link { return true }
+        // MRP answers the queue request right after its handshake; nothing playing = no answer.
+        return nowPlaying != nil || ContinuousClock.now - since > Remote.knowledgeWait.playing
+    }
+
+    /// Calls `done` once the TV has received everything sent so far, with `true`; or with
+    /// `false` after `timeout` seconds or when the session ended first. A session that is
+    /// about to be closed (tvctl without the app) waits for this: bytes handed to the
+    /// network aren't known to arrive otherwise.
+    ///
+    /// How: a cheap request goes out behind everything else and the TV answers it (it reads
+    /// the connection in order); MRP messages are acknowledged frame by frame
+    /// (`MediaRemote.unacknowledged`). The answer also carries the media-control flags.
+    public func flush(timeout: Double = 1, then done: @escaping @MainActor (Bool) -> Void) {
+        guard case .session = phase else { return done(false) }
+        var answered = false
+        raw("FetchMediaControlStatus", [:]) { [weak self] reply, _ in
+            answered = true
+            self?.controlsAnswer(reply)
+        }
+        poll(for: timeout, until: { [weak self] in
+            guard let self, case .session = self.phase else { return true }
+            return answered && (self.media?.unacknowledged ?? 0) == 0
+        }, then: { [weak self] _ in
+            guard let self, case .session = self.phase else { return done(false) }
+            done(answered)
+        })
+    }
+
     /// Touch surface (1000×1000): phase 1 press, 3 hold/move, 4 release, 5 click.
     public func touch(x: Double, y: Double, phase: Int) {
         guard case .session = self.phase else { return }
@@ -194,4 +255,18 @@ extension Remote {
             w.string("_cy"); w.int(Int64(min(1000, max(0, y))))
         }
     }
+}
+
+/// Calls `done(true)` as soon as `ready()` holds (checked now, then every 2 ms), or
+/// `done(false)` once `seconds` have passed. For the few waits that have more than one
+/// thing to wait for; nothing on a key press's path uses it.
+@MainActor
+func poll(for seconds: Double, until ready: @escaping @MainActor () -> Bool, then done: @escaping @MainActor (Bool) -> Void) {
+    let start = ContinuousClock.now
+    @MainActor func check() {
+        if ready() { return done(true) }
+        if ContinuousClock.now - start > .seconds(seconds) { return done(false) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.002) { MainActor.assumeIsolated { check() } }
+    }
+    check()
 }
